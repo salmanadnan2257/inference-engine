@@ -1,0 +1,17 @@
+{
+  "machine": {
+    "cpu": "11th Gen Intel(R) Core(TM) i7-1185G7 @ 3.00GHz",
+    "cores": 8,
+    "platform": "Linux-6.8.0-134-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "device": "cpu"
+  },
+  "timestamp": "2026-07-06T19:08:26",
+  "model": "gpt2",
+  "max_tokens": 32,
+  "num_requests": 8,
+  "total_new_tokens": 256,
+  "wall_time_s": 6.394,
+  "throughput_tok_s": 40.04,
+  "latency_mean_s": 0.799
+}

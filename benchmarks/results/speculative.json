@@ -1,0 +1,30 @@
+{
+  "machine": {
+    "cpu": "11th Gen Intel(R) Core(TM) i7-1185G7 @ 3.00GHz",
+    "cores": 8,
+    "platform": "Linux-6.8.0-134-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "device": "cpu"
+  },
+  "timestamp": "2026-07-06T19:09:17",
+  "target_model": "gpt2",
+  "draft_model": "distilgpt2",
+  "num_speculative_tokens": 4,
+  "max_tokens": 64,
+  "temperature": 0.0,
+  "num_requests": 4,
+  "plain": {
+    "tokens": 256,
+    "wall_time_s": 5.728,
+    "throughput_tok_s": 44.69
+  },
+  "speculative": {
+    "tokens": 256,
+    "wall_time_s": 7.958,
+    "throughput_tok_s": 32.17,
+    "acceptance_rate": 0.5404,
+    "drafted": 322,
+    "accepted": 174
+  },
+  "speedup": 0.72
+}

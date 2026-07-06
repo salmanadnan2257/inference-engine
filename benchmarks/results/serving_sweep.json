@@ -1,0 +1,59 @@
+{
+  "machine": {
+    "cpu": "11th Gen Intel(R) Core(TM) i7-1185G7 @ 3.00GHz",
+    "cores": 8,
+    "platform": "Linux-6.8.0-134-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "device": "cpu"
+  },
+  "timestamp": "2026-07-06T19:09:51",
+  "model": "gpt2",
+  "max_tokens": 32,
+  "temperature": 0.0,
+  "levels": [
+    {
+      "concurrency": 1,
+      "num_requests": 8,
+      "total_new_tokens": 256,
+      "wall_time_s": 5.729,
+      "throughput_tok_s": 44.69,
+      "ttft_mean_s": 0.069,
+      "ttft_p50_s": 0.07,
+      "ttft_p95_s": 0.095,
+      "ttft_max_s": 0.095
+    },
+    {
+      "concurrency": 4,
+      "num_requests": 8,
+      "total_new_tokens": 256,
+      "wall_time_s": 3.055,
+      "throughput_tok_s": 83.8,
+      "ttft_mean_s": 0.266,
+      "ttft_p50_s": 0.317,
+      "ttft_p95_s": 0.318,
+      "ttft_max_s": 0.318
+    },
+    {
+      "concurrency": 8,
+      "num_requests": 8,
+      "total_new_tokens": 256,
+      "wall_time_s": 2.255,
+      "throughput_tok_s": 113.52,
+      "ttft_mean_s": 0.541,
+      "ttft_p50_s": 0.541,
+      "ttft_p95_s": 0.543,
+      "ttft_max_s": 0.543
+    },
+    {
+      "concurrency": 16,
+      "num_requests": 16,
+      "total_new_tokens": 512,
+      "wall_time_s": 4.72,
+      "throughput_tok_s": 108.47,
+      "ttft_mean_s": 1.266,
+      "ttft_p50_s": 1.266,
+      "ttft_p95_s": 1.27,
+      "ttft_max_s": 1.27
+    }
+  ]
+}
