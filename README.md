@@ -193,6 +193,7 @@ future work (see below).
 - **UTF-8 across token boundaries.** GPT-2 byte-level BPE can split a
   multi-byte character over two tokens, so naive per-token decoding emits
   U+FFFD. Detokenization holds back a partial tail until it decodes cleanly.
+- **Writing the exhaustive project documentation honestly.** The documentation pass stalled once and had to be rerun; the retry also found leftover scratch files from an unrelated project sitting in the shared build directory and had to identify and discard them before building anything new. Getting the architecture diagrams to render cleanly took several rounds of fixing real layout bugs (clipped labels, text overflowing the page) that only showed up after actually compiling and looking at the output.
 
 ## What I learned
 
