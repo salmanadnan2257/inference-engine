@@ -1,0 +1,2536 @@
+% explainer-source-hash: 1052a15d1085016c71a43388b5cf19496148b7f043cde42de9084a313d139b3f
+% explainer-source-commit: cf2330e37a9828ebbd882ac081c6898966fee6b5
+% explainer-generated: 2026-07-16
+% Regenerate with /explain-all (see WIRING.md). Do not edit this stamp by hand:
+% it is how the toolchain knows whether this document still matches the code.
+\documentclass[11pt,a4paper]{article}
+\input{preamble}
+
+\title{\textbf{inference-engine}\\[0.3em]
+\large An LLM serving engine built from scratch:\\
+paged KV cache, continuous batching, speculative decoding\\[0.6em]
+\normalsize Deep Dive}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+\begin{keyidea}{How to read this document}
+This is an exhaustive walkthrough of one project, written for a reader who has
+never served a language model and does not need to have. Every technical term is
+defined in a \textbf{Jargon} box the first time it appears. Every red
+\textbf{honest} box is a real finding about the code: a weakness, an
+inconsistency, a claim that does not survive contact with the source, or a limit
+worth knowing before someone else finds it. They are the most valuable part of
+the document.
+\end{keyidea}
+
+\tableofcontents
+\newpage
+
+% ======================================================================
+\section{What this project is}
+
+\file{inference-engine} is a program that takes a trained language model and
+turns it into a \emph{service}: an HTTP server that many people can send prompts
+to at the same time, that streams words back as they are produced, and that
+shares one machine's memory between all of them without falling over.
+
+It is written in Python on top of PyTorch. It runs the GPT-2 family of models
+(\code{gpt2} and \code{distilgpt2}) on an ordinary CPU. Hugging Face, the
+standard library for pretrained models, is used for exactly two things: to
+download the trained weights, and to turn text into numbers and back. Every
+mechanism that makes it a \emph{serving engine}, the forward pass, the attention
+computation, the memory allocator, the scheduler, the sampler, the speculative
+decoder and the HTTP surface, is implemented in this repository.
+
+\begin{keyidea}{The one-sentence summary}
+A language model can only produce one word at a time, and remembering what it has
+already read is what makes that affordable. This project is an implementation of
+the memory management and scheduling that makes remembering affordable \emph{for
+many users at once}, rebuilt small enough to fit in one person's head and
+measured honestly instead of assumed.
+\end{keyidea}
+
+\subsection{What it is not}
+
+Being precise about the boundary matters more than the feature list:
+
+\begin{itemize}
+\item It is \textbf{not a training system}. It never computes a gradient and
+      never updates a weight. It only runs models forward.
+\item It is \textbf{not a competitor to vLLM or TensorRT-LLM}. Those are
+      production systems with hand-written GPU kernels. This is a study
+      implementation of the same ideas, at roughly 1{,}000 lines of engine and
+      server code, that happens to work.
+\item It is \textbf{not GPU code}. It runs on CPU, which changes which
+      optimizations pay off. The project is unusually honest about this, and
+      section~\ref{sec:bench} shows a headline feature (speculative decoding)
+      measured going \emph{backwards} on CPU, reported as such rather than
+      quietly dropped.
+\end{itemize}
+
+\subsection{The size of the thing}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lrl}
+\toprule
+\textbf{Area} & \textbf{Lines} & \textbf{What lives there} \\
+\midrule
+\file{engine/} & 815 & the whole engine: cache, scheduler, model, sampling \\
+\file{server/} & 206 & FastAPI surface and the CLI entry point \\
+\file{tests/} & 731 & 7 test modules, 55 tests \\
+\file{benchmarks/} & 271 & the measurement harness \\
+\file{docs/}, README & 355 & prose documentation \\
+\bottomrule
+\end{tabular}
+\caption{Tracked source, counted with \code{wc -l} over \code{git ls-files}. The
+engine is smaller than its tests, which is the right ratio for code whose whole
+claim is correctness under pressure.}
+\end{table}
+
+% ======================================================================
+\section{Background from zero: what a language model actually does}
+
+Nothing in this section is specific to the project. It is the minimum needed for
+the rest to mean anything. A reader who already knows what a KV cache is can jump
+to section~\ref{sec:problem}.
+
+\subsection{Text becomes numbers}
+
+\begin{jargon}{Token}
+A token is a chunk of text, usually a common word or a fragment of one. Models do
+not read letters or words; they read tokens. The sentence
+\code{The meaning of life is} becomes five tokens; a rare word like
+\code{antidisestablishmentarianism} might become six. Each distinct token has an
+integer id. GPT-2's vocabulary has 50{,}257 of them.
+\end{jargon}
+
+\begin{jargon}{Tokenizer}
+The program that converts text to token ids and back. GPT-2 uses \emph{byte-level
+BPE} (Byte Pair Encoding), which means it operates on raw bytes, not characters.
+This detail causes a real bug later (section~\ref{sec:detok}), so it is worth
+holding onto: a single character that takes several bytes to write, an emoji or
+an accented letter, can be \emph{split across two tokens}.
+\end{jargon}
+
+\begin{jargon}{Logits}
+Given the tokens so far, the model outputs one number per vocabulary entry scoring
+how good that token would be as the next one. That vector of 50{,}257 numbers is
+called the logits. It is not yet a probability: turning it into one requires the
+softmax function, which exponentiates every entry and divides by the total so they
+sum to 1.
+\end{jargon}
+
+\subsection{The autoregressive loop}
+
+A language model has exactly one skill: given a sequence of tokens, predict the
+next one. Everything else is a loop around that skill. To produce a sentence, you
+predict one token, glue it onto the end of the input, and predict again.
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tikzpicture}[node distance=7mm]
+  \node[box] (p) {Prompt tokens\\ \code{[464, 3616, 286, 1204, 318]}};
+  \node[box, right=12mm of p] (m) {Model\\forward pass};
+  \node[box, right=12mm of m] (l) {Logits\\ \code{[50257]} numbers};
+  \node[box, right=12mm of l] (s) {Sampler\\picks one id};
+  \node[box, below=10mm of s] (t) {New token\\ \code{257}};
+  \draw[flow] (p) -- (m);
+  \draw[flow] (m) -- (l);
+  \draw[flow] (l) -- (s);
+  \draw[flow] (s) -- (t);
+  \draw[dflow] (t) -| node[lbl, pos=0.25, below] {append and repeat} ($(p.south)+(0,-1.2)$) -- (p.south);
+\end{tikzpicture}}
+\caption{The autoregressive loop. Every token you read from a chatbot cost one
+full pass through the model. This loop is the entire job; the rest of the project
+exists to make it cheap and to run many of these loops at once.}
+\end{figure}
+
+\subsection{Attention, and why the loop is expensive}
+
+\begin{jargon}{Transformer, layer, attention}
+A transformer is the model architecture behind essentially every modern language
+model. It is a stack of near-identical \emph{layers}. GPT-2 has 12; distilgpt2 has
+6. The important part of each layer is \emph{attention}: for every token position,
+the model looks back at every earlier position and decides how much each one
+matters right now.
+\end{jargon}
+
+\begin{jargon}{Query, key, value (Q, K, V)}
+Attention works by giving every token three derived vectors. The \textbf{query} is
+what this position is looking for. The \textbf{key} is what a position offers,
+used for matching. The \textbf{value} is the information actually retrieved.
+Position $i$ compares its query against the key of every position $j \le i$,
+converts those match scores to weights with softmax, and returns the weighted
+mixture of those positions' values. Restricting to $j \le i$ is called
+\emph{causal} masking: a token may not see the future.
+\end{jargon}
+
+Here is the problem. To predict token 501, attention at every layer needs the keys
+and values of tokens 1 through 500. Recomputing them means re-running the whole
+model over 500 positions to produce a single new token, and doing it again for
+token 502. Generating $n$ tokens naively costs $O(n^2)$ work.
+
+\subsection{The KV cache, the idea the whole project rests on}
+
+\begin{keyidea}{Why a KV cache exists}
+The key and value vectors for token 5 depend only on tokens 1 through 5. They do
+not depend on tokens 6, 7, or 500. Causal masking guarantees the past cannot see
+the future, so \textbf{the past never changes}. Compute each token's keys and
+values once, store them, and every later step just reads them back. The loop drops
+from $O(n^2)$ to $O(n)$ and generation becomes practical.
+
+That store is the \textbf{KV cache}. Everything difficult about serving language
+models follows from one fact: the cache is large, it grows with every token, and
+you have to decide who gets to keep theirs.
+\end{keyidea}
+
+\begin{figure}[H]
+\centering
+\resizebox{0.9\textwidth}{!}{
+\begin{tikzpicture}
+  \node[lbl, font=\small\bfseries\upshape, text=warnred, anchor=west] at (0,1.0)
+    {Without a cache: recompute every past position, every step};
+  \foreach \i/\n in {0/5, 1/6, 2/7, 3/8} {
+    \draw[draw=warnred, fill=warnred!15] (0,{-\i*0.7-0.24}) rectangle ({\n*0.55},{-\i*0.7+0.24});
+    \node[font=\tiny, text=warnred] at ({\n*0.55/2},{-\i*0.7}) {recompute \n\ positions};
+  }
+  \node[lbl, anchor=west, text=warnred, font=\scriptsize] at (5.2,-1.05)
+    {work grows with the\\square of the length};
+
+  \begin{scope}[yshift=-4.0cm]
+  \node[lbl, font=\small\bfseries\upshape, text=okgreen, anchor=west] at (0,1.0)
+    {With a KV cache: compute one new position, read the rest back};
+  \foreach \i/\n in {0/5, 1/6, 2/7, 3/8} {
+    \draw[draw=accent, fill=accent!20] (0,{-\i*0.7-0.24}) rectangle ({\n*0.55},{-\i*0.7+0.24});
+    \node[font=\tiny, text=inkblue] at ({\n*0.55/2},{-\i*0.7}) {cached, read back};
+    \draw[draw=okgreen, fill=okgreen!35] ({\n*0.55},{-\i*0.7-0.24}) rectangle ({\n*0.55+0.5},{-\i*0.7+0.24});
+    \node[font=\tiny, text=okgreen] at ({\n*0.55+0.25},{-\i*0.7}) {new};
+  }
+  \node[lbl, anchor=west, text=okgreen, font=\scriptsize] at (5.2,-1.05)
+    {work grows linearly;\\memory grows linearly too};
+  \end{scope}
+\end{tikzpicture}}
+\caption{The trade the KV cache makes: it converts repeated computation into
+retained memory. The memory it retains is the resource this entire project is
+about allocating.}
+\end{figure}
+
+\subsection{How big is the cache, concretely}
+
+The numbers matter, because they are why paging is worth building. For \code{gpt2}
+at this project's default settings (\file{engine/config.py}:
+\code{num\_blocks=512}, \code{block\_size=16}), the cache holds
+$512 \times 16 = 8192$ token slots. GPT-2 has 12 layers, 12 attention heads, and a
+head dimension of 64. Storing keys \emph{and} values in \code{float32}:
+
+\[
+8192 \;\mathrm{slots} \times 12 \;\mathrm{heads} \times 64 \;\mathrm{dims} \times 4
+\;\mathrm{bytes} \times 12 \;\mathrm{layers} \times 2 \;(K, V) \approx 604 \;\mathrm{MB}
+\]
+
+\begin{keyidea}{The cache is bigger than the model}
+GPT-2 has about 124 million parameters, roughly 500\,MB in \code{float32}. Its KV
+cache at this configuration is about 604\,MB. The weights are a fixed cost paid
+once; the cache is a per-user cost that grows with every token every user
+generates. On a real deployment, the KV cache, not the model, is what runs out
+first. That is why an entire project exists to manage it.
+\end{keyidea}
+
+Note the configuration is deliberately balanced: \code{max\_model\_len} is 1024
+(GPT-2's architectural limit) and \code{max\_batch\_size} is 8. Eight sequences at
+full length is $8 \times 1024 = 8192$ tokens, exactly the cache capacity. The
+defaults are sized so that the worst case fits, which is why preemption
+(section~\ref{sec:preempt}) has to be provoked deliberately in tests. It is also,
+as section~\ref{sec:verify} shows, the only thing standing between the speculative
+path and a crash.
+
+% ======================================================================
+\section{The problem: why naive KV caching wastes most of the memory}
+\label{sec:problem}
+
+The obvious way to store a KV cache is to give each sequence one contiguous block
+of memory big enough for the longest answer it could produce. This is what a
+straightforward implementation does, and it is bad in three separate ways at once.
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tikzpicture}
+  \node[lbl, font=\small\bfseries\upshape, text=warnred, anchor=west] at (0,1.3)
+    {Naive: one contiguous reservation per sequence, sized for the worst case};
+  \foreach \i/\name/\used in {0/A/3, 1/B/1, 2/C/2} {
+    \node[lbl, anchor=east, font=\scriptsize] at (-0.15,{-\i*0.85}) {seq \name};
+    \draw[draw=linegrey, fill=white] (0,{-\i*0.85-0.28}) rectangle (8,{-\i*0.85+0.28});
+    \draw[draw=inkblue, fill=accent!30] (0,{-\i*0.85-0.28}) rectangle ({\used*0.9},{-\i*0.85+0.28});
+    \node[font=\tiny, text=black!60] at ({\used*0.9+(8-\used*0.9)/2},{-\i*0.85})
+      {reserved for tokens that may never exist};
+  }
+  \node[lbl, anchor=west, text=warnred] at (0,-2.9)
+    {(1) over-reservation \quad (2) a long request blocks short ones \quad (3) freed gaps are the wrong shape for the next arrival};
+
+  \begin{scope}[yshift=-4.6cm]
+  \node[lbl, font=\small\bfseries\upshape, text=okgreen, anchor=west] at (0,1.3)
+    {Paged: fixed-size blocks handed out on demand, in any order};
+  \foreach \i/\name/\blocks in {0/A/{2,7,3}, 1/B/{5}, 2/C/{0,6}} {
+    \node[lbl, anchor=east, font=\scriptsize] at (-0.15,{-\i*0.85}) {seq \name};
+    \foreach \b [count=\j from 0] in \blocks {
+      \draw[draw=inkblue, fill=accent!30] ({\j*1.0},{-\i*0.85-0.28}) rectangle ({\j*1.0+0.9},{-\i*0.85+0.28});
+      \node[font=\tiny, text=inkblue] at ({\j*1.0+0.45},{-\i*0.85}) {blk \b};
+    }
+  }
+  \node[lbl, anchor=west, text=okgreen] at (0,-2.9)
+    {waste is at most one partial block per sequence; every free block fits every request, so external fragmentation cannot exist};
+  \end{scope}
+\end{tikzpicture}}
+\caption{The core reframing the project borrows from operating systems. A sequence
+stops owning a \emph{region} and starts owning a \emph{list of block numbers}.
+Physical order stops mattering.}
+\label{fig:naive-vs-paged}
+\end{figure}
+
+\begin{jargon}{Fragmentation, internal and external}
+\textbf{External} fragmentation is having enough free memory in total but not in
+one contiguous piece, so a request fails anyway. \textbf{Internal} fragmentation
+is space wasted inside an allocation you did take, because it was rounded up.
+Fixed-size blocks trade the first for the second: external fragmentation becomes
+\emph{impossible} (every free block is interchangeable), and internal
+fragmentation is capped at one block per sequence. That is an excellent trade, and
+it is exactly the trade an operating system's virtual memory makes.
+\end{jargon}
+
+\begin{keyidea}{Paging, in one paragraph}
+Your computer already does this. A program thinks it has one long stretch of
+memory; the operating system actually gives it scattered fixed-size \emph{pages}
+and keeps a \emph{page table} translating "the address the program thinks it is
+using" into "where it really is". This project applies that idea one level up: a
+sequence thinks it has a smooth run of token positions, the engine gives it
+scattered fixed-size blocks, and a \emph{block table} does the translation. The
+paper this comes from (vLLM, Kwon et al.\ 2023) calls the result
+\emph{PagedAttention}. Everything valuable follows from the translation layer:
+once addresses are indirect, two sequences can point at the same physical block,
+and sharing becomes free.
+\end{keyidea}
+
+% ======================================================================
+\section{Repository map}
+
+\begin{figure}[H]
+\centering
+\begin{forest} dirtree
+[inference-engine
+  [engine/ \quad \textnormal{\itshape the whole engine, no framework}
+    [config.py \quad \textnormal{\itshape EngineConfig, SamplingParams}]
+    [sequence.py \quad \textnormal{\itshape one generation stream's state}]
+    [cache.py \quad \textnormal{\itshape physical KV tensors}]
+    [block\_manager.py \quad \textnormal{\itshape allocator: free lists, prefix cache, COW}]
+    [scheduler.py \quad \textnormal{\itshape admission, batching, preemption}]
+    [model.py \quad \textnormal{\itshape GPT-2 forward + paged attention}]
+    [sampling.py \quad \textnormal{\itshape greedy, temperature, top-k, top-p}]
+    [speculative.py \quad \textnormal{\itshape accept/reject sampling}]
+    [llm\_engine.py \quad \textnormal{\itshape the synchronous core: step()}]
+    [async\_engine.py \quad \textnormal{\itshape the step loop in a worker thread}]
+  ]
+  [server/
+    [app.py \quad \textnormal{\itshape FastAPI, OpenAI-compatible, SSE}]
+    [\_\_main\_\_.py \quad \textnormal{\itshape python -m server}]
+  ]
+  [tests/ \quad \textnormal{\itshape 7 modules, 55 tests}]
+  [benchmarks/
+    [bench.py \quad \textnormal{\itshape sweep / baseline / speculative}]
+    [results/ \quad \textnormal{\itshape committed JSON with machine info}]
+  ]
+  [docs/ARCHITECTURE.md]
+]
+\end{forest}
+\caption{The layout. The dependency direction is strictly downward:
+\file{server} imports \file{engine}, \file{engine} imports nothing of
+\file{server}, and \file{block\_manager.py} imports no tensor library at all.}
+\end{figure}
+
+\begin{keyidea}{The single best structural decision in this codebase}
+\file{engine/block\_manager.py} does not import \code{torch}. It is pure
+bookkeeping: it hands out integers and returns \emph{instructions} of the form
+"copy physical block 4 to physical block 9". \file{engine/cache.py} is the only
+file that touches KV tensors, and it does what it is told.
+
+This split is why the allocator is testable. \file{tests/test\_block\_manager.py}
+has 15 tests covering fragmentation, refcounting, copy-on-write, LRU eviction and
+rollback, and it runs in under a second because it never loads a model. Most of
+the genuinely hard logic in a serving engine is in that file, and the split makes
+it verifiable in isolation. This is the reusable lesson from the project.
+\end{keyidea}
+
+% ======================================================================
+\section{Architecture}
+
+\begin{figure}[H]
+\centering
+\resizebox{0.98\textwidth}{!}{
+\begin{tikzpicture}[node distance=6mm]
+  \node[extbox, minimum width=10cm] (client) {HTTP clients (\code{curl}, \code{httpx}, OpenAI SDKs)};
+
+  \node[box, below=8mm of client, minimum width=13cm, align=left] (app)
+    {\textbf{server/app.py} \hfill FastAPI, OpenAI-compatible surface\\
+     \scriptsize pydantic validation \quad SSE fan-out \quad one \code{asyncio.Queue} per sequence};
+
+  \node[box, below=6mm of app, minimum width=13cm, align=left] (async)
+    {\textbf{engine/async\_engine.py} \hfill AsyncEngine\\
+     \scriptsize background step loop \quad blocking work in a worker thread \quad one lock over step/add/abort};
+
+  \node[box, below=6mm of async, minimum width=13cm, align=left, minimum height=5.4cm, fill=white] (core) {};
+  \node[anchor=north west, font=\small, text=inkblue] at ($(core.north west)+(4mm,-3mm)$)
+    {\textbf{engine/llm\_engine.py} \hfill LLMEngine: the synchronous core, \code{step()}};
+
+  \node[box, below left=12mm and -6.1cm of core.north] (sched)
+    {\textbf{Scheduler}\\\scriptsize waiting deque\\\scriptsize running list\\\scriptsize preemption};
+  \node[box, right=10mm of sched] (bm)
+    {\textbf{BlockManager}\\\scriptsize free list + refcounts\\\scriptsize prefix hash table (LRU)\\\scriptsize returns COW copy ops};
+  \node[box, right=10mm of bm] (spec)
+    {\textbf{Speculative path}\\\scriptsize draft GPT2 + own\\\scriptsize BlockManager, shadow\\\scriptsize sequence per target};
+
+  \node[box, below=8mm of bm, minimum width=11.5cm, align=center] (runner)
+    {\textbf{ModelRunner + GPT2} (\file{engine/model.py})\\
+     \scriptsize paged attention over \file{engine/cache.py} tensors, \code{[num\_blocks*block\_size, heads, head\_dim]} per layer};
+
+  \draw[flow] (client) -- node[lbl, right] {POST /v1/completions (SSE)} (app);
+  \draw[flow] (app) -- (async);
+  \draw[flow] (async) -- (core.north);
+  \draw[dflow] (sched) -- node[lbl] {can\_allocate\\blocks\_needed} (bm);
+  \draw[flow] (bm) -- node[lbl, right] {token ids, block tables,\\slot mappings} (runner);
+  \draw[flow] (spec) -- (runner);
+\end{tikzpicture}}
+\caption{Four layers. Requests flow down, tokens flow back up. Each layer only
+knows about the one below it.}
+\label{fig:arch}
+\end{figure}
+
+The reason for four layers rather than one is that they have genuinely different
+concerns: \file{app.py} knows about HTTP and knows nothing about blocks;
+\file{async\_engine.py} knows about threads and knows nothing about attention;
+\file{llm\_engine.py} knows about tokens and never touches a socket. The sharpest
+evidence that the split is real is that \file{llm\_engine.py} exposes a plain
+synchronous \code{generate()} method used by tests and benchmarks with no server
+running at all.
+
+% ======================================================================
+\section{The paged KV cache}
+
+This is the heart of the project. It is split across two files that are
+deliberately unaware of each other's concerns.
+
+\subsection{The physical store: \file{engine/cache.py}}
+
+Only 38 lines, and one idea.
+
+\begin{lstlisting}[language=Python, caption={engine/cache.py, the layout decision}]
+class KVCache:
+    def __init__(self, num_layers, num_blocks, block_size, num_heads, head_dim,
+                 dtype=torch.float32):
+        self.block_size = block_size
+        shape = (num_blocks * block_size, num_heads, head_dim)
+        self.k = [torch.zeros(shape, dtype=dtype) for _ in range(num_layers)]
+        self.v = [torch.zeros(shape, dtype=dtype) for _ in range(num_layers)]
+\end{lstlisting}
+
+The tensor is \emph{flat}. It is not shaped
+\code{[num\_blocks, block\_size, heads, dim]}; the first two dimensions are
+multiplied together. That makes a single integer, a \emph{slot id}, address
+exactly one token's keys and values in one layer:
+
+\begin{center}
+\code{slot = block\_id * block\_size + offset}
+\end{center}
+
+\begin{keyidea}{Why flatten}
+Because a flat index turns "gather the KV for these 37 scattered token positions"
+into a single tensor indexing operation, \code{self.k[layer][slots]}, with no
+reshaping and no loop. The alternative, a 4-D tensor, would need two-dimensional
+indexing at every read. This one decision is what lets the attention code stay
+short.
+\end{keyidea}
+
+The class exposes exactly three operations, and this is the whole physical
+interface to the cache:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Method} & \textbf{Called by} & \textbf{What it does} \\
+\midrule
+\code{write(layer, slots, k, v)} & \code{Attention.forward} & \code{index\_copy\_} new tokens' KV into slots \\
+\code{gather(layer, slots)} & \code{Attention.forward} & read KV rows back for attention \\
+\code{copy\_blocks(copies)} & \code{ModelRunner.apply\_copies} & perform copy-on-write duplications \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{The bookkeeping: \file{engine/block\_manager.py}}
+
+251 lines and no tensors. It tracks, for every physical block:
+
+\begin{lstlisting}[language=Python, caption={The entire per-block state}]
+@dataclass
+class Block:
+    block_id: int
+    ref_count: int = 0
+    # Hash over (prefix chain, token ids) once the block is full, else None.
+    content_hash: bytes | None = None
+\end{lstlisting}
+
+and, for the manager as a whole, four collections:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{Meaning} \\
+\midrule
+\code{free\_ids} & \code{deque[int]} & blocks holding nothing anyone wants \\
+\code{evictable} & \code{OrderedDict[int, None]} & refcount 0 \emph{but still cached content}, LRU order \\
+\code{hash\_to\_block} & \code{dict[bytes, int]} & content hash to the block holding it \\
+\code{blocks} & \code{list[Block]} & per-block refcount and hash \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{keyidea}{The two-tier free list is the prefix cache}
+A block with refcount 0 is not necessarily garbage. If it still holds the KV for a
+recognizable run of tokens, a future request with the same prompt prefix could
+reuse it \emph{without recomputing those positions at all}. So freeing a hashed
+block does not return it to \code{free\_ids}; it goes into \code{evictable}, an
+LRU queue of blocks that are available but worth keeping.
+
+\code{num\_free\_blocks} counts both tiers, because an evictable block is
+genuinely available: \code{\_pop\_free\_block} drains \code{free\_ids} first and
+only cannibalizes the least recently used evictable block when it must. The prefix
+cache therefore costs nothing in capacity. It is pure upside that occupies memory
+nobody else has asked for yet.
+\end{keyidea}
+
+\subsection{Address translation, the centerpiece}
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tikzpicture}
+  % Row 1: logical positions. Row labels live to the RIGHT of every row: the
+  % arrows run vertically through the x range of the boxes, so a label placed
+  % above a row gets struck through by them.
+  \foreach \p in {0,...,9} {
+    \draw[draw=linegrey, fill=softgrey] ({\p*0.85},1.7) rectangle ({\p*0.85+0.8},2.3);
+    \node[font=\tiny, text=inkblue] at ({\p*0.85+0.4},2.0) {p=\p};
+  }
+  \node[lbl, anchor=west] at (8.6,2.0) {\ldots};
+  \node[lbl, anchor=west, font=\scriptsize\bfseries\upshape, text=inkblue, align=left] at (9.3,2.0)
+    {what the sequence thinks\\it has: a smooth run\\of token positions};
+
+  % Row 2: the block table
+  \foreach \i/\b in {0/7, 1/2, 2/5} {
+    \draw[draw=inkblue, fill=accent!25, thick] ({\i*2.55},0.15) rectangle ({\i*2.55+2.4},0.75);
+    \node[font=\scriptsize, text=inkblue] at ({\i*2.55+1.2},0.45) {table[\i] = block \b};
+  }
+  \node[lbl, anchor=west, font=\scriptsize\bfseries\upshape, text=inkblue, align=left] at (9.3,0.45)
+    {\code{seq.block\_table}\\a plain Python\\list of ints};
+
+  % Row 3: physical slots
+  \foreach \b in {0,...,9} {
+    \draw[draw=linegrey, fill=white] ({\b*0.85},-1.8) rectangle ({\b*0.85+0.8},-1.2);
+    \node[font=\tiny, text=black!50] at ({\b*0.85+0.4},-1.5) {blk \b};
+  }
+  \foreach \b in {7,2,5} {
+    \draw[draw=inkblue, fill=accent!25, thick] ({\b*0.85},-1.8) rectangle ({\b*0.85+0.8},-1.2);
+    \node[font=\tiny, text=inkblue] at ({\b*0.85+0.4},-1.5) {blk \b};
+  }
+  \node[lbl, anchor=west, font=\scriptsize\bfseries\upshape, text=inkblue, align=left] at (9.3,-1.5)
+    {physical KV tensor,\\one flat row per slot\\(per layer)};
+
+  \draw[flow] (1.2,0.15) -- ({7*0.85+0.4},-1.2);
+  \draw[flow] (3.75,0.15) -- ({2*0.85+0.4},-1.2);
+  \draw[flow] (6.3,0.15) -- ({5*0.85+0.4},-1.2);
+  \draw[dflow] (1.7,1.7) -- (1.2,0.75);
+  \draw[dflow] (4.25,1.7) -- (3.75,0.75);
+
+  \node[box, anchor=west, align=left, font=\scriptsize] at (0,-3.1)
+    {\textbf{The translation}, \file{block\_manager.py}, \code{slot\_mapping}:\\[2pt]
+     \code{slot = block\_table[p // block\_size] * block\_size + p \% block\_size}\\[2pt]
+     with \code{block\_size = 4} here: position 6 lives in \code{table[1] = block 2}, offset 2,\\
+     so its flat slot is \code{2*4 + 2 = 10}. Physical order is arbitrary and irrelevant.};
+\end{tikzpicture}}
+\caption{Logical position to physical slot. This indirection is the entire
+mechanism; refcounting, prefix caching and copy-on-write are all consequences of
+it existing.}
+\label{fig:paging}
+\end{figure}
+
+The implementation is a one-line list comprehension, which is the point:
+
+\begin{lstlisting}[language=Python, caption={The translation, in full}]
+def slot_mapping(self, seq, start, end):
+    """Flat physical slot indices for token positions [start, end)."""
+    return [seq.block_table[p // self.block_size] * self.block_size
+            + p % self.block_size
+            for p in range(start, end)]
+\end{lstlisting}
+
+\begin{honest}{This is a Python loop on the hot path}
+\code{slot\_mapping} is called for every sequence on every step, and
+\code{ModelRunner.execute} calls it twice per sequence: once for the write slots
+and once to gather \emph{the entire context} (\code{slot\_mapping(s, 0, lens[b])}).
+For a sequence with 500 tokens in a batch of 8, that is 4{,}000 Python-level
+modulo and division operations per step, before any tensor math happens, and then
+a \code{torch.tensor(...)} constructed from that Python list.
+
+On CPU with GPT-2 this is invisible because the model forward dominates by orders
+of magnitude. On a GPU with a fast model it would be a serious bottleneck, and it
+is the kind of overhead real engines eliminate by keeping block tables resident on
+the device as tensors. The project's README is candid about the attention kernel
+not being truly paged; it does not mention this adjacent cost. Worth knowing
+before an interviewer asks what would break first on a GPU.
+\end{honest}
+
+\subsection{Allocation: \code{can\_allocate} and \code{allocate}}
+
+Admission is two-phase, and the split is deliberate. \code{can\_allocate} asks
+"would this fit?" without side effects, so the scheduler can decide without
+committing. \code{allocate} then does it, and re-checks:
+
+\begin{lstlisting}[language=Python, caption={block\_manager.py, allocation}]
+def can_allocate(self, seq):
+    matched = self._match_prefix(seq.token_ids)
+    matched_evictable = sum(1 for bid in matched if bid in self.evictable)
+    needed = seq.num_blocks_needed(self.block_size) - len(matched)
+    return self.num_free_blocks - matched_evictable >= needed
+\end{lstlisting}
+
+The \code{matched\_evictable} term repays a subtle debt. \code{num\_free\_blocks}
+counts evictable blocks as free. But blocks this sequence is about to \emph{reuse}
+from the prefix cache are also counted there, and it is about to take them out of
+that pool. Counting them as both "available for the new allocation" and "available
+to satisfy the remaining need" would double count. Subtracting them fixes it. This
+is the kind of off-by-a-pool error that produces an empty free list mid-step, and
+it is handled correctly.
+
+\begin{honest}{\code{\_match\_prefix} runs three times per admission}
+\code{Scheduler.schedule} calls \code{can\_allocate}, which calls
+\code{\_match\_prefix}. It then calls \code{allocate}, which calls
+\code{can\_allocate} again (which calls \code{\_match\_prefix} again), and then
+calls \code{\_match\_prefix} a third time itself. Each call walks the whole prompt
+computing a chain of SHA-256 hashes, one per full block.
+
+It is correct, and on CPU it is lost in the noise next to a transformer forward
+pass. It is still three times the necessary work on the admission path, and the
+result of the first call could simply have been threaded through. A reviewer will
+spot it; better to have the answer ready ("correct, redundant, and the profile
+says it does not matter here") than to be surprised by it.
+\end{honest}
+
+\subsection{Refcounting, forks and copy-on-write}
+
+\begin{jargon}{Reference counting}
+Each block records how many sequences currently point at it. Sharing is a
+\code{+1}. Releasing is a \code{-1}. At zero, the block is reclaimable. This is the
+same technique CPython uses to know when your objects can be freed.
+\end{jargon}
+
+\begin{jargon}{Copy-on-write (COW)}
+Two sequences may safely share a block as long as both only \emph{read} it. The
+instant one wants to \emph{write}, it must first take a private copy, so the other
+one's data is not corrupted. Deferring the copy until a write actually happens
+means the copy usually never happens at all. This is exactly what the Unix
+\code{fork(2)} system call does with process memory, and the project uses the same
+name for the same reason.
+\end{jargon}
+
+\begin{figure}[H]
+\centering
+\resizebox{0.95\textwidth}{!}{
+\begin{tikzpicture}
+  \def\rowa{0} \def\rowb{-1.0}
+  \node[lbl, font=\small\bfseries\upshape, text=inkblue, anchor=west] at (0,0.9) {1. Parent alone};
+  \node[lbl, anchor=east, font=\scriptsize] at (-0.1,\rowa) {parent};
+  \foreach \i/\b in {0/3, 1/8} {
+    \draw[draw=inkblue, fill=accent!25] ({\i*1.1},{\rowa-0.25}) rectangle ({\i*1.1+1.0},{\rowa+0.25});
+    \node[font=\tiny, text=inkblue] at ({\i*1.1+0.5},\rowa) {blk \b \; rc=1};
+  }
+
+  \begin{scope}[xshift=4.2cm]
+  \node[lbl, font=\small\bfseries\upshape, text=inkblue, anchor=west] at (0,0.9) {2. \code{fork()}: refcount bump only};
+  \node[lbl, anchor=east, font=\scriptsize] at (-0.1,\rowa) {parent};
+  \node[lbl, anchor=east, font=\scriptsize] at (-0.1,\rowb) {child};
+  \foreach \i/\b in {0/3, 1/8} {
+    \draw[draw=inkblue, fill=accent!25] ({\i*1.1},{\rowa-0.25}) rectangle ({\i*1.1+1.0},{\rowa+0.25});
+    \node[font=\tiny, text=inkblue] at ({\i*1.1+0.5},\rowa) {blk \b \; rc=2};
+    \draw[draw=inkblue, fill=accent!25, dashed] ({\i*1.1},{\rowb-0.25}) rectangle ({\i*1.1+1.0},{\rowb+0.25});
+    \node[font=\tiny, text=inkblue] at ({\i*1.1+0.5},\rowb) {blk \b};
+  }
+  \node[lbl, anchor=west, text=okgreen, font=\tiny] at (0,-1.75) {zero bytes copied};
+  \end{scope}
+
+  \begin{scope}[xshift=8.6cm]
+  \node[lbl, font=\small\bfseries\upshape, text=inkblue, anchor=west] at (0,0.9) {3. Child writes into blk 8};
+  \node[lbl, anchor=east, font=\scriptsize] at (-0.1,\rowa) {parent};
+  \node[lbl, anchor=east, font=\scriptsize] at (-0.1,\rowb) {child};
+  \draw[draw=inkblue, fill=accent!25] (0,{\rowa-0.25}) rectangle (1.0,{\rowa+0.25});
+  \node[font=\tiny, text=inkblue] at (0.5,\rowa) {blk 3 \; rc=2};
+  \draw[draw=inkblue, fill=accent!25] (1.1,{\rowa-0.25}) rectangle (2.1,{\rowa+0.25});
+  \node[font=\tiny, text=inkblue] at (1.6,\rowa) {blk 8 \; rc=1};
+  \draw[draw=inkblue, fill=accent!25, dashed] (0,{\rowb-0.25}) rectangle (1.0,{\rowb+0.25});
+  \node[font=\tiny, text=inkblue] at (0.5,\rowb) {blk 3};
+  \draw[draw=warnred, fill=warnred!15, very thick] (1.1,{\rowb-0.25}) rectangle (2.1,{\rowb+0.25});
+  \node[font=\tiny, text=warnred] at (1.6,\rowb) {blk 4 (copy)};
+  \draw[flow, draw=warnred] (1.6,{\rowa-0.25}) -- node[lbl, right, text=warnred] {COW} (1.6,{\rowb+0.25});
+  \node[lbl, anchor=west, text=okgreen, font=\tiny] at (0,-1.85) {only the written block copied;\\ blk 3 stays shared};
+  \end{scope}
+\end{tikzpicture}}
+\caption{Copy-on-write, as pinned by \code{test\_fork\_shares\_then\_copies}. Note
+stage 3: the \emph{full} block 3 stays shared forever, because a full block's
+contents can never change. Only the partially filled tail block is ever copied.
+Sharing an \code{n}-token prompt across \code{n} completions costs one block copy,
+not \code{n} prompt recomputations.}
+\label{fig:cow}
+\end{figure}
+
+The write path is \code{append\_slots}, and it does three jobs in one pass:
+
+\begin{lstlisting}[language=Python, caption={block\_manager.py, append\_slots (abridged)}]
+def append_slots(self, seq):
+    copies = []
+    first_write_block = seq.num_computed // self.block_size
+    for i in range(first_write_block, len(seq.block_table)):
+        bid = seq.block_table[i]
+        if self.blocks[bid].ref_count > 1:
+            new_bid = self._pop_free_block()      # (1) copy-on-write
+            copies.append((bid, new_bid))
+            seq.block_table[i] = new_bid
+            self._unref_block(bid)
+            self.stats.cow_copies += 1
+        elif self.blocks[bid].content_hash is not None:
+            self._deregister(bid)                 # (2) in-place rewrite
+    total = seq.num_blocks_needed(self.block_size)
+    while len(seq.block_table) < total:
+        seq.block_table.append(self._pop_free_block())   # (3) growth
+    ...
+    return copies
+\end{lstlisting}
+
+Branch (2) is the subtle one and the project calls it out as its hardest bug.
+
+\begin{keyidea}{The stale-hash bug, and why it is the interesting one}
+The prefix cache says "block 8 contains exactly this run of tokens; anyone whose
+prompt starts that way may reuse it". That promise is only true while block 8's
+contents match its hash.
+
+Almost nothing rewrites already-computed positions, so the promise almost always
+holds. But two features do rewrite them: a \textbf{speculative rollback} throws
+away rejected tokens and writes different ones over the same positions, and
+\textbf{stop-string truncation} does the same. If block 8 was hashed and then
+rewritten in place, the hash table now hands out a block whose contents silently
+changed, and a future request gets another request's KV data for part of its
+prompt. The output would be subtly, unreproducibly wrong.
+
+The fix is one branch: the instant a registered block is about to be written in
+place, drop its hash. \code{test\_truncate\_deregisters\_rewritten\_block} pins it.
+This is the kind of bug that only exists once two independently correct features
+(prefix caching, speculative decoding) meet, which is exactly what makes it worth
+the story.
+\end{keyidea}
+
+\subsection{Prefix caching and the hash chain}
+
+\begin{figure}[H]
+\centering
+\resizebox{0.95\textwidth}{!}{
+\begin{tikzpicture}[node distance=6mm]
+  \node[box, font=\tiny] (b0) {block 0 tokens\\ \code{[464, 3616, 286, 1204]}};
+  \node[box, right=14mm of b0, font=\tiny] (b1) {block 1 tokens\\ \code{[318, 284, 307, 257]}};
+  \node[box, right=14mm of b1, font=\tiny] (b2) {block 2 tokens\\ \code{[1310, 2183, 11, 290]}};
+
+  \node[store, below=9mm of b0, font=\tiny] (h0) {h0 = sha256(\code{b""} + toks)};
+  \node[store, below=9mm of b1, font=\tiny] (h1) {h1 = sha256(h0 + toks)};
+  \node[store, below=9mm of b2, font=\tiny] (h2) {h2 = sha256(h1 + toks)};
+
+  \draw[flow] (b0) -- (h0);
+  \draw[flow] (b1) -- (h1);
+  \draw[flow] (b2) -- (h2);
+  \draw[flow] (h0) -- node[lbl, above] {chained} (h1);
+  \draw[flow] (h1) -- node[lbl, above] {chained} (h2);
+
+  \node[box, below=9mm of h1, minimum width=12cm, align=left, font=\scriptsize] (why)
+    {\textbf{Why chain rather than hash each block alone?}\\
+     Because \code{[318, 284, 307, 257]} appearing after \emph{a different} prefix has
+     different keys and values: attention at those positions looked back at a different
+     past. An unchained hash would collide two blocks that hold different numbers, and
+     hand back the wrong KV. The chain makes the hash name the \emph{whole prefix}, not
+     the window.};
+  \draw[dflow] (h1) -- (why);
+\end{tikzpicture}}
+\caption{The prefix hash chain, \code{\_hash\_block} in \file{block\_manager.py}.
+Only \emph{full} blocks are hashed: a partial block's contents are still changing,
+so it has no stable identity.}
+\label{fig:hashchain}
+\end{figure}
+
+\begin{honest}{The prefix cache trusts SHA-256 to not collide, silently}
+\code{hash\_to\_block} maps a 32-byte digest to a block id and never verifies that
+the block's tokens actually match. A collision would serve one request's KV cache
+to another. This is the correct engineering call, a SHA-256 collision is not a
+thing that happens, and vLLM makes the same call, but it is worth being able to
+say out loud that the cache's correctness rests on a cryptographic assumption
+rather than a comparison. Storing the token ids alongside and checking on hit
+would cost one list comparison per hit and remove the assumption entirely.
+\end{honest}
+
+There is one non-obvious rule in \code{\_match\_prefix} worth pulling out:
+
+\begin{lstlisting}[language=Python]
+max_match_tokens = len(token_ids) - 1
+num_full = max_match_tokens // self.block_size
+\end{lstlisting}
+
+\begin{keyidea}{Why a fully cached prompt still recomputes its last block}
+Suppose a request's prompt is \emph{identical} to one served a moment ago, so every
+block of it is in the prefix cache. If the engine matched all of it, it would have
+nothing to run the model on, and the model produces logits only for positions it
+actually computes. With zero positions to compute, there are no logits, and no
+first token.
+
+So matching is capped at \code{len(token\_ids) - 1} tokens, guaranteeing at least
+one position is always recomputed.
+\code{test\_no\_match\_capped\_below\_full\_prompt} pins it: an 8-token prompt with
+all 8 tokens cached reports \code{num\_cached\_tokens == 4}, not 8. It is a
+one-line rule that would produce a baffling crash if it were missing.
+\end{keyidea}
+
+\subsection{Capacity accounting: \code{blocks\_needed}}
+
+\begin{lstlisting}[language=Python, caption={The worst-case demand estimate}]
+def blocks_needed(self, seq, num_new_tokens):
+    new_len = len(seq.token_ids) + num_new_tokens
+    total = (new_len + self.block_size - 1) // self.block_size
+    growth = max(0, total - len(seq.block_table))
+    first_write_block = seq.num_computed // self.block_size
+    cow = sum(1 for i in range(first_write_block, len(seq.block_table))
+              if self.blocks[seq.block_table[i]].ref_count > 1)
+    return growth + cow
+\end{lstlisting}
+
+Two demands are summed: blocks needed because the sequence got \emph{longer}, and
+blocks needed because it is about to write into blocks it \emph{shares}. Forgetting
+the second term would let the engine admit a batch that fits by length and then run
+out of blocks halfway through resolving copy-on-write.
+\code{test\_can\_append\_accounts\_for\_cow} pins exactly that.
+
+\begin{keyidea}{The invariant that makes \code{num\_new\_tokens=0} correct}
+\code{Scheduler.schedule} calls \code{blocks\_needed(s, self.lookahead)} where
+\code{lookahead} is 0 without speculative decoding. Asking "how many blocks to add
+zero tokens?" looks like a bug, and is not.
+
+\file{sequence.py} documents the invariant: between steps,
+\code{num\_computed == len(token\_ids) - 1}. The token sampled at the end of the
+previous step is \emph{already appended} to \code{token\_ids}; it simply has not
+been fed through the model yet. So the sequence's length already accounts for the
+token about to be computed, and zero further tokens need to be added. With
+speculative decoding, \code{lookahead = k} because the draft is about to append
+\code{k} more.
+
+This is genuinely elegant and genuinely confusing. Anyone reading
+\file{scheduler.py} in isolation will read it as an off-by-one. The invariant is
+documented in \file{sequence.py} and nowhere near the call site.
+\end{keyidea}
+
+% ======================================================================
+\section{The model: GPT-2 rebuilt, with paged attention}
+
+\file{engine/model.py} is an independent implementation of the GPT-2 forward pass.
+Hugging Face is asked for the trained numbers and nothing else.
+
+\subsection{Loading weights, and the transpose that matters}
+
+\begin{lstlisting}[language=Python, caption={model.py, from\_hf}]
+# HF Conv1D stores weights as [in, out]; nn.Linear wants [out, in].
+for name in ("attn.c_attn", "attn.c_proj", "mlp.c_fc", "mlp.c_proj"):
+    new_sd[f"{dst}.{name}.weight"] = sd[f"{src}.{name}.weight"].t().contiguous()
+    new_sd[f"{dst}.{name}.bias"] = sd[f"{src}.{name}.bias"]
+\end{lstlisting}
+
+The original GPT-2 used a layer called \code{Conv1D} which stores its matrix
+transposed relative to PyTorch's standard \code{nn.Linear}. Loading the weights
+without the \code{.t()} produces a model that runs, has no error, and emits
+nonsense. This class of bug is why the parity test exists.
+
+\begin{keyidea}{Verify against a reference before building anything on top}
+\file{tests/test\_parity.py} runs the same prompts through this implementation and
+through Hugging Face's, and asserts the largest disagreement in any of the 50{,}257
+logits is under \code{1e-3}. The README reports the measured values: about
+\code{3e-5} on distilgpt2 and \code{2e-4} on gpt2, which is float32 rounding noise,
+not a difference in the math.
+
+The payoff is stated in the README's own "what I learned" and it is the right
+lesson: with parity established, every later bug is a \emph{systems} bug. When the
+paged attention path produced wrong output, the question was never "did I get the
+transformer wrong?". A second test,
+\code{test\_paged\_forward\_matches\_cache\_free}, extends the same discipline to
+the cache: the paged path and the plain causal path must agree to \code{1e-4}.
+\end{keyidea}
+
+\subsection{Attention against a paged cache}
+
+The attention module has two modes, chosen by whether a \code{ForwardContext} is
+supplied. Without one, it is a textbook causal attention used by the parity tests.
+With one, it is the paged path:
+
+\begin{lstlisting}[language=Python, caption={model.py, the paged attention path}]
+ctx.cache.write(layer_idx, ctx.slot_mapping,
+                k.reshape(B * T, self.n_head, self.head_dim),
+                v.reshape(B * T, self.n_head, self.head_dim))
+keys, values = ctx.cache.gather(layer_idx, ctx.gather_slots.reshape(-1))
+Lmax = ctx.gather_slots.shape[1]
+keys = keys.view(B, Lmax, self.n_head, self.head_dim).transpose(1, 2)
+values = values.view(B, Lmax, self.n_head, self.head_dim).transpose(1, 2)
+out = F.scaled_dot_product_attention(q.transpose(1, 2), keys, values,
+                                     attn_mask=ctx.attn_mask)
+\end{lstlisting}
+
+The ordering is load-bearing: \textbf{write before gather}. The new token's own key
+and value must be in the cache before the gather reads the context, because a token
+attends to itself. Reversing those two lines would silently drop the diagonal of
+the attention matrix.
+
+\begin{figure}[H]
+\centering
+\resizebox{0.95\textwidth}{!}{
+\begin{tikzpicture}[node distance=7mm]
+  \node[box] (x) {hidden states\\ \code{[B, T, E]}};
+  \node[box, right=9mm of x] (qkv) {\code{c\_attn}\\ splits into q, k, v};
+  \node[store, right=9mm of qkv] (w) {\textbf{write}\\ \code{cache.write(layer,}\\ \code{slot\_mapping, k, v)}};
+  \node[store, right=9mm of w] (g) {\textbf{gather}\\ \code{cache.gather(layer,}\\ \code{gather\_slots)}};
+  \node[box, below=9mm of g] (mask) {additive mask\\ \code{[B, 1, T, Lmax]}\\ \scriptsize 0 to keep, \code{-inf} to hide};
+  \node[box, left=9mm of mask] (sdpa) {\code{scaled\_dot\_product\_}\\\code{attention}};
+  \node[box, left=9mm of sdpa] (o) {\code{c\_proj}\\ output};
+
+  \draw[flow] (x) -- (qkv);
+  \draw[flow] (qkv) -- node[lbl] {k, v} (w);
+  \draw[flow] (w) -- (g);
+  \draw[flow] (g) -- node[lbl, right] {K, V padded\\to Lmax} (mask.north);
+  \draw[flow] (mask) -- (sdpa);
+  \draw[flow] (sdpa) -- (o);
+  \draw[dflow] (qkv.south) |- node[lbl, pos=0.75, below] {q, straight through} (sdpa.east);
+\end{tikzpicture}}
+\caption{One attention layer's paged path. Every layer shares the same
+\code{ForwardContext}, so the slot arithmetic is done once per forward, not twelve
+times.}
+\end{figure}
+
+The mask construction deserves a look because it handles prefill, decode and
+speculative verification with the same three lines:
+
+\begin{lstlisting}[language=Python, caption={model.py, one mask for every mode}]
+key_pos = torch.arange(Lmax).view(1, 1, Lmax)
+limit = torch.tensor([s.num_computed for s in seqs]).view(B, 1, 1) \
+    + torch.arange(T).view(1, T, 1)
+mask = torch.where(key_pos <= limit, 0.0, NEG_INF).view(B, 1, T, Lmax)
+\end{lstlisting}
+
+Query row \code{t} of sequence \code{b} may attend to key positions up to
+\code{num\_computed[b] + t}. When \code{T = 1} (decode) this keeps exactly the
+sequence's real length and hides the padding. When \code{T = k+1} (speculative
+verification) it reconstructs a causal triangle across the drafted tokens.
+Sequences shorter than \code{Lmax} have their padding slots pointing at physical
+slot 0, which holds some other sequence's real data, and the mask is what makes
+that harmless: those columns are always beyond the limit and get \code{-inf}.
+
+\begin{honest}{The attention is not actually paged, and the README says so}
+This is the project's own headline caveat and the code confirms it exactly.
+\code{gather} pulls each sequence's scattered KV into a \emph{dense padded} tensor
+of shape \code{[B, Lmax, H, D]} and hands it to a standard attention kernel. So:
+\begin{itemize}
+\item The \textbf{memory} savings of paging are completely real. Nothing is
+      over-reserved and nothing is fragmented.
+\item The \textbf{compute} savings are not. A batch of one 500-token sequence and
+      seven 20-token sequences pads all eight to 500 and does attention arithmetic
+      on 3{,}360 positions of nothing.
+\item The gather itself \emph{materializes a copy} of the whole batch's context,
+      every layer, every step. That allocation is proportional to
+      \code{B * Lmax * H * D} and is the thing paging was supposed to avoid
+      touching.
+\end{itemize}
+A real engine writes a fused kernel that walks the block table inside the attention
+computation. The README states this plainly and gives the honest reason for not
+doing it (on CPU with a small model it was not the bottleneck). That is a defensible
+call and a well-documented one. It is also the single biggest gap between this
+project and the systems it studies, so it should be the first thing volunteered, not
+the first thing discovered.
+\end{honest}
+
+% ======================================================================
+\section{Sequences, scheduling and continuous batching}
+
+\subsection{What a sequence is}
+
+\file{engine/sequence.py} is a dataclass and its docstring carries the invariant
+everything else depends on:
+
+\begin{lstlisting}[language=Python, caption={sequence.py, the state}]
+@dataclass
+class Sequence:
+    seq_id: int
+    token_ids: list[int]        # prompt + generated, always
+    params: SamplingParams
+    arrival_time: float = 0.0
+    status: SequenceStatus = SequenceStatus.WAITING
+    block_table: list[int] = field(default_factory=list)
+    num_prompt_tokens: int = 0
+    num_computed: int = 0       # how many have KV in the cache
+    num_cached_tokens: int = 0  # how many came free from the prefix cache
+    finish_reason: FinishReason | None = None
+    generator: torch.Generator | None = None
+    num_preemptions: int = 0
+\end{lstlisting}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[node distance=16mm]
+  \node[box] (w) {\textbf{WAITING}\\\scriptsize in \code{scheduler.waiting}};
+  \node[box, right=28mm of w] (r) {\textbf{RUNNING}\\\scriptsize in \code{scheduler.running}\\\scriptsize holds blocks};
+  \node[box, right=28mm of r] (f) {\textbf{FINISHED}\\\scriptsize blocks released};
+  \draw[flow] (w) to[bend left=12] node[lbl, above] {\code{schedule()}: batch room\\and \code{can\_allocate}} (r);
+  \draw[flow, draw=warnred] (r) to[bend left=12] node[lbl, below] {\code{\_preempt()}: KV pressure,\\blocks freed, \code{num\_computed=0}} (w);
+  \draw[flow] (r) -- node[lbl, above] {EOS, stop string,\\\code{max\_tokens}, abort} (f);
+\end{tikzpicture}
+\caption{The sequence state machine. Preemption is the only backward edge, and it
+is total: the sequence loses its blocks and its progress markers, keeping only its
+\code{token\_ids}.}
+\label{fig:states}
+\end{figure}
+
+\subsection{Static versus continuous batching}
+
+\begin{jargon}{Batching}
+Running several sequences through the model together in one call. It is faster than
+running them one after another because the model's weights get loaded from memory
+once and reused across the whole batch, and because matrix multiplication hardware
+is far more efficient on a big matrix than on several small ones.
+\end{jargon}
+
+The naive way to batch is to collect a group of requests, run them together, and
+return when they are all done. The problem is that they do not finish together.
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tikzpicture}[x=0.62cm, y=0.62cm]
+  \node[lbl, font=\small\bfseries\upshape, text=warnred, anchor=west] at (0,1.6)
+    {Static batching: the batch is frozen until the slowest request finishes};
+  \foreach \r/\name/\len in {0/A/12, 1/B/4, 2/C/6, 3/D/3} {
+    \node[lbl, anchor=east, font=\scriptsize] at (-0.2,{-\r*0.85}) {\name};
+    \draw[draw=inkblue, fill=accent!30] (0,{-\r*0.85-0.28}) rectangle (\len,{-\r*0.85+0.28});
+    \node[font=\tiny, text=inkblue] at ({\len/2},{-\r*0.85}) {generating};
+    \ifnum\len<12
+      \draw[draw=warnred, fill=warnred!12, dashed] (\len,{-\r*0.85-0.28}) rectangle (12,{-\r*0.85+0.28});
+      \node[font=\tiny, text=warnred] at ({(\len+12)/2},{-\r*0.85}) {padding: computed, thrown away};
+    \fi
+  }
+  \draw[draw=warnred, very thick, dashed] (12,0.6) -- (12,-3.0);
+  \node[lbl, anchor=west, text=warnred, font=\scriptsize] at (12.6,-1.2)
+    {everyone waits\\for A; E cannot\\start at all};
+  \node[lbl, anchor=west, font=\scriptsize] at (0,-3.4) {E arrives here $\rightarrow$};
+  \draw[flow, draw=warnred] (2.4,-3.4) -- (2.4,-2.7);
+
+  \begin{scope}[yshift=-6.2cm]
+  \node[lbl, font=\small\bfseries\upshape, text=okgreen, anchor=west] at (0,1.6)
+    {Continuous batching: the batch is re-decided at every token boundary};
+  % token boundaries drawn first, so the bars sit on top of them
+  \foreach \t in {1,...,11} { \draw[draw=linegrey, dotted] (\t,1.2) -- (\t,-4.7); }
+  \foreach \r/\name/\e in {0/A/12, 1/B/4, 2/C/6, 3/D/3} {
+    \node[lbl, anchor=east, font=\scriptsize] at (-0.2,{-\r*0.85}) {\name};
+    \draw[draw=inkblue, fill=accent!30] (0,{-\r*0.85-0.28}) rectangle (\e,{-\r*0.85+0.28});
+    \node[font=\tiny, text=inkblue] at ({\e/2},{-\r*0.85}) {generating};
+    \ifnum\e<12
+      \draw[draw=okgreen, fill=okgreen!35] (\e,{-\r*0.85-0.28}) rectangle ({\e+0.3},{-\r*0.85+0.28});
+    \fi
+  }
+  % Annotate the freed-blocks marker once only, placed directly to the right of
+  % B's end marker in empty space: repeating it on every row collided with the
+  % right-hand summary, and an arrow to it struck through row A's bar.
+  \node[lbl, anchor=west, text=okgreen, font=\tiny] at (4.45,-0.85) {done: blocks freed at once};
+
+  \node[lbl, anchor=east, font=\scriptsize] at (-0.2,-3.4) {E};
+  \draw[draw=okgreen, fill=okgreen!30] (2.4,{-3.4-0.28}) rectangle (10,{-3.4+0.28});
+  \node[font=\tiny, text=inkblue] at (6.2,-3.4) {joins at the next boundary};
+  \node[lbl, anchor=east, font=\scriptsize] at (-0.2,-4.25) {F};
+  \draw[draw=okgreen, fill=okgreen!30] (5,{-4.25-0.28}) rectangle (11.5,{-4.25+0.28});
+  \node[font=\tiny, text=inkblue] at (8.25,-4.25) {so does F};
+  \draw[flow, draw=okgreen] (2.4,-5.0) -- (2.4,-3.75);
+  \node[lbl, anchor=west, font=\scriptsize] at (0,-5.2) {E arrives here $\rightarrow$ and starts almost immediately};
+  \node[lbl, anchor=west, font=\scriptsize] at (12.6,-1.6)
+    {no padding,\\no waiting,\\blocks recycled\\continuously};
+  \end{scope}
+\end{tikzpicture}}
+\caption{The mechanism behind the project's measured 2.5x throughput gain. The win
+is not from making any single request faster; it is from never computing padding
+and never idling. The dotted lines are token boundaries: the only points at which
+the scheduler is allowed to change its mind.}
+\label{fig:batching}
+\end{figure}
+
+\subsection{The scheduler}
+
+\file{engine/scheduler.py} is 95 lines and runs once per step. It does two things
+in order.
+
+\textbf{First, admit.} FIFO, while there is both batch room and KV space:
+
+\begin{lstlisting}[language=Python]
+while self.waiting and len(self.running) < self.config.max_batch_size:
+    seq = self.waiting[0]
+    if not self.block_manager.can_allocate(seq):
+        break
+    self.waiting.popleft()
+    self.block_manager.allocate(seq)
+    seq.status = SequenceStatus.RUNNING
+    self.running.append(seq)
+    out.prefill.append(seq)
+\end{lstlisting}
+
+Note the \code{break}, not \code{continue}. A prompt too big to fit blocks
+everything behind it rather than being skipped over. That is strict FIFO with no
+starvation, at the cost of head-of-line blocking. It is a real trade and it is made
+silently.
+
+\textbf{Second, guarantee the step can happen.} This is the interesting half:
+
+\begin{lstlisting}[language=Python, caption={scheduler.py, the cumulative check}]
+decode = [s for s in self.running if s not in out.prefill]
+while decode:
+    needed = sum(self.block_manager.blocks_needed(s, self.lookahead)
+                 for s in decode)
+    if needed <= self.block_manager.num_free_blocks:
+        break
+    victim = max(self.running, key=lambda s: (s.arrival_time, s.seq_id))
+    self._preempt(victim)
+    out.preempted.append(victim)
+    ...
+\end{lstlisting}
+
+\begin{keyidea}{Cumulative, not per-sequence: the bug worth telling}
+The obvious implementation checks each sequence against the free list on its own.
+With three sequences each needing one block and two blocks free, every individual
+check passes ("I need 1, there are 2 free"), the batch is admitted, and the third
+sequence crashes mid-step against an empty free list.
+
+The check must be \code{sum(...)} across the whole batch, because the sequences are
+not competing with the free list, they are competing with \emph{each other}. The
+project's README names this as its second-hardest bug and credits
+\code{test\_scheduler\_invariants\_under\_churn} with catching it. That test is
+worth reading: it runs 300 scheduling steps over six sequences in a cache
+deliberately too small, and asserts after every single one that
+\code{used + num\_free\_blocks == num\_blocks}. It is a hand-rolled property test,
+and it is what turns "I think the accounting is right" into evidence.
+\end{keyidea}
+
+\subsection{Preemption}
+\label{sec:preempt}
+
+\begin{jargon}{Preemption}
+Kicking a running job out to make room, intending to resume it later. Your
+operating system preempts processes off the CPU constantly. Here the scarce
+resource is not CPU but KV cache blocks.
+\end{jargon}
+
+\begin{lstlisting}[language=Python, caption={scheduler.py, \_preempt}]
+def _preempt(self, seq):
+    self.block_manager.free_seq(seq)
+    seq.num_computed = 0
+    seq.num_cached_tokens = 0
+    seq.num_preemptions += 1
+    seq.status = SequenceStatus.WAITING
+    self.running.remove(seq)
+    self.waiting.appendleft(seq)     # front, not back
+    self.num_preemptions += 1
+\end{lstlisting}
+
+Three decisions are packed into nine lines:
+
+\begin{enumerate}
+\item \textbf{Victim selection: newest arrival.} \code{max(...)} by
+      \code{(arrival\_time, seq\_id)}. Sacrificing the newest protects the oldest,
+      which has the most computed tokens to lose and has waited longest. Evicting
+      the oldest instead would risk starving it forever.
+\item \textbf{Requeue at the \emph{front}.} \code{appendleft}, so the victim is
+      first in line when space appears. Without this, a preempted sequence could be
+      starved behind arrivals that were not even submitted when it started.
+\item \textbf{Recompute, do not swap.} The blocks are gone; the sequence keeps only
+      \code{token\_ids} and redoes its prefill from scratch. The alternative,
+      copying KV out to slower memory and back, is what a GPU engine does. On CPU
+      the "device" memory and host memory are the same memory, so swapping would be
+      a pure-overhead no-op. The README makes this argument and it is correct.
+\end{enumerate}
+
+\begin{keyidea}{Why recompute is cheaper than it sounds}
+Preemption throws away the prompt's KV, and re-admission has to prefill again. But
+the prefix cache is still holding those exact blocks in its evictable pool. Unless
+they were cannibalized in the meantime, re-admission gets most of the prompt back
+for a refcount bump. The two features compose: preemption is cheap \emph{because}
+prefix caching exists.
+\end{keyidea}
+
+\begin{honest}{A just-admitted prompt can be preempted in the same step}
+\code{victim = max(self.running, ...)} scans everything running, including
+sequences admitted moments earlier in the same \code{schedule()} call. Because the
+victim is the newest arrival, and a just-admitted sequence usually \emph{is} the
+newest arrival, the loop can allocate a prompt's blocks and then immediately free
+them again. The code handles it correctly (\code{out.prefill.remove(victim)} keeps
+the decision consistent), so this is wasted work, not a bug: an \code{allocate} and
+a \code{free\_seq} for nothing, plus the sequence goes back to the front of the
+queue it just left. Admitting only after confirming the decode batch fits would
+avoid the churn.
+\end{honest}
+
+% ======================================================================
+\section{The engine step}
+
+\file{engine/llm\_engine.py} is the largest file (357 lines) and \code{step()} is
+the function the whole project exists to make possible.
+
+\begin{figure}[H]
+\centering
+\resizebox{0.93\textwidth}{!}{
+\begin{tikzpicture}[node distance=8mm]
+  \node[box] (s) {\code{scheduler.schedule()}};
+  \node[dec, below=7mm of s] (pre) {any\\preempted?};
+  \node[box, right=12mm of pre] (drop) {\code{\_drop\_shadow()}\\\scriptsize free the draft cache mirror};
+  \node[dec, below=8mm of pre] (pf) {prompts to\\prefill?};
+  \node[box, right=12mm of pf, align=left] (pfrun)
+    {\textbf{for each prompt, one at a time:}\\
+     \scriptsize \code{runner.execute([seq], bm)}\\
+     \scriptsize fork any \code{n>1} siblings (COW)\\
+     \scriptsize sample first token};
+  \node[dec, below=13mm of pf] (dec) {sequences\\to decode?};
+  \node[dec, right=12mm of dec] (sp) {draft model\\configured?};
+  \node[box, right=12mm of sp, align=left] (spec)
+    {\code{\_speculative\_decode()}\\\scriptsize draft k, verify k+1, accept/reject};
+  \node[box, below=8mm of sp, align=left] (plain)
+    {\code{\_decode()}\\\scriptsize \code{append\_slots} $\rightarrow$ \code{apply\_copies}\\
+     \scriptsize $\rightarrow$ one batched forward $\rightarrow$ sample};
+  \node[box, below=10mm of dec] (post) {\code{\_postprocess()} each output:\\
+    \scriptsize detokenize, EOS, stop strings, max\_tokens};
+  \node[box, below=7mm of post] (out) {\code{list[StepOutput]}};
+
+  \draw[flow] (s) -- (pre);
+  \draw[flow] (pre) -- node[lbl, above] {yes} (drop);
+  \draw[flow] (pre) -- node[lbl, right] {no} (pf);
+  \draw[flow] (drop) |- (pf);
+  \draw[flow] (pf) -- node[lbl, above] {yes} (pfrun);
+  \draw[flow] (pf) -- node[lbl, right] {no} (dec);
+  \draw[flow] (pfrun) |- (dec);
+  \draw[flow] (dec) -- node[lbl, above] {yes} (sp);
+  \draw[flow] (sp) -- node[lbl, above] {yes} (spec);
+  \draw[flow] (sp) -- node[lbl, right] {no} (plain);
+  \draw[flow] (dec) -- node[lbl, right] {no} (post);
+  \draw[flow] (spec.south) -- ++(0,-0.6) -| (post.east);
+  \draw[flow] (plain.west) -- (post.east);
+  \draw[flow] (post) -- (out);
+\end{tikzpicture}}
+\caption{One \code{step()}. Every running sequence advances by exactly one token
+boundary: one token normally, up to \code{k+1} with speculative decoding.}
+\label{fig:step}
+\end{figure}
+
+\subsection{Prefill and decode are different shapes}
+
+\begin{jargon}{Prefill and decode}
+\textbf{Prefill} is the first pass over a new prompt: many token positions go in at
+once, and only the last one's logits are wanted. It is compute-heavy.
+\textbf{Decode} is every subsequent step: exactly one token position per sequence
+goes in. It is memory-bandwidth-heavy, because the model's whole weight matrix has
+to be read to produce a single token. This asymmetry is why batching helps decode
+so much: eight sequences decoding together read the weights once instead of eight
+times.
+\end{jargon}
+
+The engine runs them differently, and \code{ModelRunner.execute} enforces why:
+
+\begin{lstlisting}[language=Python]
+T = len(seqs[0]) - seqs[0].num_computed
+assert T >= 1 and all(len(s) - s.num_computed == T for s in seqs)
+\end{lstlisting}
+
+Every sequence in one call must contribute the \emph{same} number of new positions,
+because the input is a rectangular tensor \code{[B, T]}. Decode satisfies this
+trivially (\code{T=1} for everyone). Speculative verification satisfies it because
+\code{k} is chosen as a minimum over the batch. Prefill cannot: prompts have
+different lengths. Hence:
+
+\begin{lstlisting}[language=Python, caption={llm\_engine.py, step(): prefills are unbatched}]
+for seq in decision.prefill:
+    logits = self.runner.execute([seq], self.block_manager)
+\end{lstlisting}
+
+\begin{honest}{Unbatched prefill is what the TTFT numbers are actually measuring}
+The README lists "prefills run one at a time" under "what I'd do differently" and
+gives a reason (CPU prefill is already compute-bound). But it does not connect it to
+its own benchmark table, and the connection is direct.
+
+Time-to-first-token in \file{benchmarks/results/serving\_sweep.json} goes 0.069s,
+0.266s, 0.541s, 1.266s at concurrency 1, 4, 8, 16. That is very close to linear in
+concurrency, and a single sequential prefill of these prompts takes about 0.07s.
+Eight simultaneous arrivals means eight prefills executed one after another, and the
+eighth client waits for all of them: $8 \times 0.07 \approx 0.55$s, against a
+measured 0.541s.
+
+So the TTFT curve is not a general property of continuous batching. It is a direct
+readout of this specific unbatched-prefill decision. The README describes the TTFT
+growth as "the expected tradeoff", which understates it: batching ragged prompts (as
+the README itself proposes) would flatten most of that curve. This is a strong point
+to make voluntarily, because it demonstrates reading one's own benchmark rather than
+reporting it. \emph{(This paragraph's arithmetic is an inference drawn from the
+committed JSON and the code, not a separately measured claim.)}
+\end{honest}
+
+\subsection{Forking for \code{n > 1}}
+
+When a request asks for several completions of one prompt, re-running the prompt per
+completion would be pure waste. Instead siblings are held back until the parent's
+prefill has produced its KV, then forked onto it:
+
+\begin{lstlisting}[language=Python, caption={llm\_engine.py, step(): sibling forks}]
+for child in self._pending_forks.pop(seq.seq_id, []):
+    tok = sample_token(logits[0, -1], child.params, child.token_ids,
+                       child.generator)
+    if len(self.scheduler.running) < self.config.max_batch_size:
+        self.block_manager.fork(seq, child)
+        child.append_token(tok)
+        child.status = SequenceStatus.RUNNING
+        self.scheduler.running.append(child)
+        outputs.append(self._postprocess(child, [tok]))
+    else:
+        # No batch room: requeue as an ordinary request; the
+        # prefix cache makes its prefill nearly free.
+        self.scheduler.add(child)
+\end{lstlisting}
+
+The siblings share the parent's \emph{entire} prompt (figure~\ref{fig:cow}) and
+diverge only when one writes, which happens on its first decode step and costs
+exactly one block copy. They sample different tokens from the same logits because
+\code{add\_request} gives each sibling \code{i} its own generator seeded with
+\code{params.seed + i}.
+
+\begin{honest}{Seeded \code{n > 1} is not reproducible under load, and nothing tests it}
+Look at the \code{else} branch. When there is no batch room, the child has
+\emph{already consumed a random draw} from its generator via \code{sample\_token} on
+the line above, and that token is then discarded and the child requeued. Its eventual
+prefill samples again, from a generator that has advanced by one draw.
+
+So the same request, with the same seed, produces different output depending on
+whether the batch happened to be full at that instant. That makes seeded determinism,
+an explicitly advertised feature ("seeded determinism" in the README's feature list),
+conditional on server load for \code{n > 1}.
+
+The test suite does not catch it: \code{test\_n\_completions\_fork\_with\_cow} uses
+\code{max\_batch\_size=4} with \code{n=2}, so the branch never fires, and
+\code{test\_n\_gives\_multiple\_choices} checks that two choices come back but never
+checks reproducibility. The fix is small (sample the child's token after deciding
+which path it takes, or do not sample at all on the requeue path). The finding is not
+that the bug is severe; it is that a documented guarantee has a load-dependent hole
+with no test on it.
+\end{honest}
+
+\subsection{Detokenization and the UTF-8 holdback}
+\label{sec:detok}
+
+\begin{jargon}{UTF-8, and why a character can be split}
+UTF-8 encodes most characters in one byte but many in two to four. GPT-2's tokenizer
+works on bytes, so a token boundary can land \emph{in the middle} of a character.
+Decoding just the first half yields the Unicode replacement character, the
+black-diamond question mark shown when text is broken.
+\end{jargon}
+
+\begin{lstlisting}[language=Python, caption={llm\_engine.py, Detokenizer (the guard condition is described below, not shown)}]
+class Detokenizer:
+    def delta(self, seq, state):
+        text = self.tokenizer.decode(seq.output_token_ids,
+                                     skip_special_tokens=True)
+        # if text ends with the Unicode replacement character U+FFFD:
+        #     return ""      <- hold back, wait for the next token
+        delta = text[len(state.emitted_text):]
+        state.emitted_text = text
+        return delta
+\end{lstlisting}
+
+\begin{keyidea}{Why the code cannot be pasted verbatim here}
+The real guard is \code{if text.endswith(...)} comparing against a literal U+FFFD
+character. That character is multi-byte, and \code{pdflatex} has no glyph for it;
+pasting it into a code listing is a hard build failure, not a cosmetic one. It is
+described rather than shown, deliberately. The logic is: if the decoded text ends in
+a broken character, emit nothing this step and try again next step, when the second
+half of the character will have arrived.
+\end{keyidea}
+
+\begin{honest}{The detokenizer is quadratic in the output length}
+\code{delta()} decodes \code{seq.output\_token\_ids} \emph{in full}, every step, and
+then slices off the part already emitted. Generating $n$ tokens therefore performs
+$n$ decodes of average length $n/2$: $O(n^2)$ work, plus $O(n^2)$ total string
+allocation, plus \code{state.emitted\_text} holding a fresh copy of the whole output
+each step.
+
+At the benchmark's 32 tokens this is free. At 1000 tokens (GPT-2's limit) it is half
+a million token-decodes per request, and on a GPU where the forward pass is fast it
+could plausibly become a visible fraction of step time. The straightforward fix,
+which real engines implement, is to keep a running byte buffer and decode only the
+new tokens, holding back an incomplete tail.
+\end{honest}
+
+\subsection{Finishing: EOS, \code{max\_tokens}, stop strings}
+
+\code{\_postprocess} applies three termination conditions in a fixed order, and each
+may have to \emph{retract} tokens that were already appended, because speculative
+decoding emits several tokens at once and only then discovers one of them was the
+end.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Condition} & \textbf{Detected on} & \textbf{Retraction} \\
+\midrule
+EOS token (id 50256) & token ids & \code{\_truncate\_tail} from the EOS onward \\
+\code{max\_tokens} & count & \code{\_truncate\_tail} the overshoot \\
+stop string & decoded text & trim the \emph{text} only; sequence ends anyway \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\code{\_truncate\_tail} is the important one, because it must keep the block table
+honest, not just the token list:
+
+\begin{lstlisting}[language=Python]
+def _truncate_tail(self, seq, drop):
+    seq.token_ids = seq.token_ids[:len(seq.token_ids) - drop]
+    seq.num_computed = min(seq.num_computed, len(seq.token_ids) - 1)
+    self.block_manager.truncate(seq, len(seq.token_ids))
+\end{lstlisting}
+
+This is the second caller (with speculative rollback) of the path that made the
+stale-hash bug possible.
+
+\begin{honest}{\code{EOS\_TOKEN\_ID = 50256} is a hardcoded module constant}
+The tokenizer knows its own EOS id (\code{tokenizer.eos\_token\_id}), and the engine
+already holds the tokenizer. Hardcoding the GPT-2 value at module level means the
+engine is silently GPT-2-family-only in a way the configuration does not express:
+point \code{--model} at any other architecture and the engine will load it, run it,
+and never stop generating, because 50256 means something else there. Given the
+project's stated scope this is defensible, but it is a one-character-of-effort fix
+that would remove a whole class of confusing failure.
+\end{honest}
+
+\begin{honest}{\code{seq\_states} grows forever: a real leak in a long-lived server}
+\code{add\_request} inserts \code{self.seq\_states[seq.seq\_id] = \_SeqState()} for
+every sequence. \code{abort()} pops the entry for sequences that were still waiting,
+and for cancelled sibling forks. But \code{\_finish()}, the path taken by every
+sequence that completes \emph{normally}, never pops it.
+
+So a server accumulates one \code{\_SeqState} per request served, forever, and each
+one holds \code{emitted\_text}: the complete generated text of that request. A server
+answering a request a second with 200-character answers retains roughly 17\,MB of
+dead completion text per day, alongside a dict that never stops growing.
+
+Nothing catches it, because every test and benchmark constructs an engine, runs a
+handful of requests, and exits. This is exactly the class of defect that only appears
+in the thing the project is named after: a long-running service. It is verified in
+section~\ref{sec:verify}, not merely read off the source.
+\end{honest}
+
+% ======================================================================
+\section{Sampling}
+
+\file{engine/sampling.py} is 68 lines and turns 50{,}257 logits into one token id.
+The order of operations is the whole content.
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tikzpicture}[node distance=8mm]
+  \node[box, font=\scriptsize] (l) {logits\\ \code{[50257]}};
+  \node[box, right=8mm of l, font=\scriptsize] (rp) {repetition\\penalty};
+  \node[box, right=8mm of rp, font=\scriptsize] (t) {temperature\\ \code{logits / T}};
+  \node[box, right=8mm of t, font=\scriptsize] (tk) {top-k\\ \scriptsize keep best k};
+  \node[box, right=8mm of tk, font=\scriptsize] (tp) {top-p\\ \scriptsize smallest set\\ \scriptsize covering p};
+  \node[box, right=8mm of tp, font=\scriptsize] (sm) {softmax};
+  \node[box, right=8mm of sm, font=\scriptsize] (mn) {\code{multinomial}\\ \scriptsize draw one};
+  \foreach \a/\b in {l/rp, rp/t, t/tk, tk/tp, tp/sm, sm/mn} { \draw[flow] (\a) -- (\b); }
+  \node[box, below=9mm of tk, font=\scriptsize, fill=warnred!8, draw=warnred, align=left] (g)
+    {\textbf{greedy shortcut} (\code{temperature == 0.0}): return \code{argmax} right after the\\
+     repetition penalty. Temperature is skipped (dividing by zero), and so is all filtering:\\
+     no top-k or top-p can change which entry is largest.};
+  \draw[dflow, draw=warnred] (rp.south) |- (g.west);
+\end{tikzpicture}}
+\caption{The sampling pipeline, \code{adjust\_logits} then \code{filter\_logits} then
+draw. Each stage is one small function with its own test in
+\file{tests/test\_sampling.py}.}
+\end{figure}
+
+\begin{jargon}{Temperature, top-k, top-p (nucleus)}
+\textbf{Temperature} divides the logits before softmax. Below 1 it sharpens the
+distribution toward the favourite; above 1 it flattens it. At exactly 0 it means
+"always take the favourite", which is \emph{greedy} decoding. \textbf{Top-k} keeps
+only the k highest-scoring tokens and discards the rest. \textbf{Top-p}, or nucleus
+sampling, keeps the smallest set of tokens whose probabilities add up to p, so the
+cut adapts: a confident position keeps few candidates, an uncertain one keeps many.
+\end{jargon}
+
+Two details in \file{sampling.py} are worth stopping on. The repetition penalty
+handles signs correctly, which a naive implementation gets wrong:
+
+\begin{lstlisting}[language=Python]
+logits[seen] = torch.where(
+    vals > 0,
+    vals / params.repetition_penalty,   # positive logit: divide it down
+    vals * params.repetition_penalty)   # negative logit: multiply it down
+\end{lstlisting}
+
+Dividing a \emph{negative} logit by a penalty greater than 1 makes it larger, so
+"penalizing" a disfavoured token would promote it. The sign split is the standard
+fix, and both branches are pinned by the test
+\code{test\_repetition\_penalty\_discourages\_seen\_tokens}.
+
+And top-p always keeps at least one token:
+
+\begin{lstlisting}[language=Python]
+remove = cum - torch.softmax(sorted_logits, dim=-1) >= params.top_p
+remove[0] = False
+\end{lstlisting}
+
+Subtracting each token's own probability from the cumulative sum implements "the
+token that crosses the threshold stays in". \code{remove[0] = False} handles the
+pathological case where the single most likely token already exceeds \code{top\_p} on
+its own, which would otherwise mask out the entire vocabulary and produce a softmax
+over nothing but \code{-inf}. \code{test\_top\_p\_always\_keeps\_best\_token} pins it.
+
+\begin{honest}{A greedy request silently ignores \code{top\_k} and \code{top\_p}}
+\code{sample\_token} returns \code{argmax} immediately when \code{params.greedy},
+before \code{filter\_logits} runs. This is arithmetically harmless: filtering only
+ever sets entries to \code{-inf}, and \code{top\_k >= 1} always keeps the maximum, so
+the argmax is identical either way. But note that \code{probs\_for}, the function used
+by the speculative path, does it the other way round: it filters first and \emph{then}
+builds the one-hot. The two functions that must agree for speculative decoding to be
+correct reach the same answer by different routes. They do agree, for the reason just
+given, but the reasoning is load-bearing and written down nowhere.
+\end{honest}
+
+% ======================================================================
+\section{Speculative decoding}
+
+This is the most mathematically interesting part of the project, and the one the
+project is most honest about.
+
+\subsection{The idea}
+
+\begin{keyidea}{Why guessing ahead can be free}
+Decode is \emph{memory-bound}, not compute-bound. Producing one token requires
+reading every weight in the model out of memory, and the arithmetic units spend most
+of that time idle. Crucially, running the model over \emph{five} token positions
+costs barely more than running it over one: the weights are read once either way.
+
+So: let a small, cheap model guess the next $k$ tokens one at a time. Then run the
+big model \emph{once} over all $k$ guesses at the same time and ask "would I have
+said that?" for each. Every guess it agrees with is a token that cost you a cheap
+forward instead of an expensive one. You get $k+1$ tokens from one big forward if all
+guesses land, and never fewer than 1 if none do.
+
+The catch, and the reason the technique is subtle, is that this must not change the
+output distribution. A user must not be able to tell that a smaller model was
+involved.
+\end{keyidea}
+
+\begin{jargon}{Draft model and target model}
+The \textbf{target} is the model you actually want answers from (\code{gpt2} here,
+124M parameters). The \textbf{draft} is a smaller, faster stand-in that proposes
+tokens (\code{distilgpt2}, 82M, a distilled version of GPT-2, so it tends to agree).
+Only the target's opinion counts. The draft is a guess machine whose guesses are
+always checked.
+\end{jargon}
+
+\subsection{The accept/reject rule}
+
+Let $q(x)$ be the draft's probability of the token it proposed and $p(x)$ the
+target's probability of the same token. The rule (Leviathan et al., 2023) is:
+
+\begin{itemize}
+\item Accept the draft token with probability $\min(1, p(x)/q(x))$.
+\item On the first rejection, discard it and every later draft, and sample a
+      replacement from the \emph{residual} distribution, normalized
+      $\max(p - q, 0)$.
+\item If every token is accepted, take a free bonus token from the target's
+      distribution at position $k+1$, which the verify pass already computed.
+\end{itemize}
+
+\begin{keyidea}{Why that exact rule, in words}
+If the target likes the token at least as much as the draft did ($p \ge q$), keep it
+unconditionally. If the target likes it \emph{less}, keep it only $p/q$ of the time,
+which is exactly the fraction that restores the target's rate.
+
+That leaves a deficit: tokens the target wanted more than the draft proposed them.
+The residual $\max(p - q, 0)$ is precisely the shape of that deficit, and sampling
+the replacement from it fills the gap exactly. Add the two paths together and the
+probability of emitting any given token is $p$ again, exactly.
+
+This is the guarantee: the output is distributed \emph{identically} to sampling from
+the target alone. Not similarly. Identically. Speculative decoding is not an
+approximation and does not trade quality for speed.
+\end{keyidea}
+
+\begin{figure}[H]
+\centering
+\resizebox{0.96\textwidth}{!}{
+\begin{tikzpicture}[node distance=7mm]
+  \node[box, align=left] (start) {\textbf{Round start}: sequence has \code{n} tokens};
+  \node[box, below=6mm of start, align=left, fill=accent!8] (draft)
+    {\textbf{Draft phase}: run the small model \code{k} times, one token each\\
+     \scriptsize records proposed token $x_i$ and its full distribution $q_i$};
+  \node[box, below=6mm of draft, align=left, fill=accent!8] (verify)
+    {\textbf{Verify phase}: ONE forward of the big model over all \code{k+1} positions\\
+     \scriptsize yields target distributions $p_0 \ldots p_k$};
+  \node[dec, below=8mm of verify] (loop) {for $i = 0 \ldots k-1$};
+  \node[dec, below=9mm of loop] (test) {$u < \min(1, p_i(x_i)/q_i(x_i))$?\\ \scriptsize $u$ drawn uniform};
+  \node[box, right=16mm of test, fill=okgreen!12, draw=okgreen] (acc) {\textbf{ACCEPT} $x_i$\\ \scriptsize keep it, continue};
+  \node[box, below=9mm of test, fill=warnred!10, draw=warnred, align=left] (rej)
+    {\textbf{REJECT} $x_i$: stop here\\
+     \scriptsize sample replacement from normalize($\max(p_i - q_i, 0)$)\\
+     \scriptsize discard $x_i \ldots x_{k-1}$; roll back BOTH caches};
+  \node[box, left=16mm of loop, fill=okgreen!12, draw=okgreen, align=left] (bonus)
+    {\textbf{ALL ACCEPTED}\\ \scriptsize free bonus token from $p_k$\\ \scriptsize $k+1$ tokens from one big forward};
+  \node[box, below=8mm of rej, align=left] (emit) {\textbf{Emit}: accepted tokens + one final token\\
+    \scriptsize always at least 1 token, at most $k+1$};
+
+  \draw[flow] (start) -- (draft);
+  \draw[flow] (draft) -- (verify);
+  \draw[flow] (verify) -- (loop);
+  \draw[flow] (loop) -- node[lbl, right] {next $i$} (test);
+  \draw[flow] (test) -- node[lbl, above] {yes} (acc);
+  \draw[flow] (acc) to[bend right=32] (loop.east);
+  \draw[flow] (test) -- node[lbl, right] {no} (rej);
+  \draw[flow] (loop) -- node[lbl, above] {loop\\ends} (bonus);
+  \draw[flow] (rej) -- (emit);
+  \draw[flow] (bonus.south) -- ++(0,-2.9) -| (emit.west);
+\end{tikzpicture}}
+\caption{\code{accept\_reject} in \file{engine/speculative.py}. The important
+structural property: the draft phase is \code{k} cheap sequential forwards, the
+verify phase is \textbf{one} expensive forward, and the loop never runs the big model
+again regardless of what it decides.}
+\label{fig:spec}
+\end{figure}
+
+\subsection{The greedy degeneration}
+
+With \code{temperature = 0}, \code{probs\_for} returns a one-hot vector. Then
+$q(x) = 1$ for the drafted token, and $p(x)$ is either 1 (the target agrees) or 0 (it
+does not). The ratio is 1 or 0: accept when the two models' argmaxes match, reject
+otherwise, and the residual $\max(p-q, 0)$ is the target's own argmax. The general
+rule collapses to "accept while the draft agrees with the target", with no randomness
+consumed at all:
+
+\begin{lstlisting}[language=Python, caption={speculative.py, accept\_reject: no draw when ratio is 1}]
+ratio = 1.0 if q_tok == 0.0 else min(1.0, p_tok / q_tok)
+u = float(torch.rand((), generator=generator)) if ratio < 1.0 else 0.0
+if u < ratio:
+    accepted.append(tok)
+    continue
+\end{lstlisting}
+
+The \code{if ratio < 1.0} guard is what makes greedy speculative output
+\emph{bit-identical} to greedy plain output rather than merely equivalent in
+distribution: no generator draw is consumed, so nothing downstream shifts.
+\code{test\_spec\_engine\_greedy\_matches\_plain\_engine} asserts exactly that,
+comparing token ids, not text.
+
+\subsection{How the correctness claim is actually evidenced}
+
+This is the strongest part of the test suite and deserves to be named as such.
+
+\begin{itemize}
+\item \code{greedy\_accept\_reject\_is\_exact}\\
+      Hand-built one-hot vectors; asserts the exact accept/reject decision.
+      Unit-level.
+\item \code{identical\_models\_accept\_everything}\\
+      Draft = target, so $p = q$ everywhere: the acceptance rate must exceed
+      0.999. Catches a mis-signed ratio.
+\item \code{empirical\_distribution\_matches\_target}\\
+      The real proof. Two tiny random transformers, a 13-token vocabulary, 4000
+      full speculative rounds; asserts the total variation distance between the
+      empirical output distribution and the target's true distribution is under
+      0.05.
+\item \code{empirical\_distribution\_with\_temperature\_and\_top\_k}\\
+      The same, with temperature 0.7 and top-k 6, proving the guarantee survives
+      logit transformation.
+\end{itemize}
+(Each name above is prefixed \code{test\_} in \file{tests/test\_speculative.py}.)
+
+\begin{jargon}{Total variation distance}
+A measure of how far apart two probability distributions are:
+$\frac{1}{2}\sum_x |P(x) - Q(x)|$. Zero means identical; one means they never agree.
+It is the right metric here because the claim is about distributions, not about
+individual tokens.
+\end{jargon}
+
+\begin{keyidea}{Testing a probabilistic guarantee empirically, correctly}
+The claim "the output is distributed exactly as the target" cannot be checked by
+comparing two outputs; every run is random. The project's answer is to shrink the
+problem until statistics become decisive: a vocabulary of 13 instead of 50{,}257, a
+two-layer random transformer instead of GPT-2, and 4000 samples. At that scale the
+sampling noise floor is around 0.02 TV, so a threshold of 0.05 catches a real bug
+while tolerating chance.
+
+The comment in the test states the expected noise level explicitly. That single line
+is the difference between a test with a threshold someone tuned until it passed and a
+test with a threshold someone derived. It is the most sophisticated piece of testing
+in the repository.
+\end{keyidea}
+
+\subsection{Two caches, two rollbacks}
+
+The draft model needs its own KV cache, its own \code{BlockManager}, and its own
+\code{Sequence} mirroring each target sequence. The project calls these
+\emph{shadows}.
+
+\begin{figure}[H]
+\centering
+\resizebox{0.9\textwidth}{!}{
+\begin{tikzpicture}[node distance=8mm]
+  \node[box, align=left] (t) {\textbf{Target side}\\\scriptsize \code{Sequence} in \code{scheduler.running}\\\scriptsize \code{BlockManager} (prefix caching ON)\\\scriptsize \code{ModelRunner} with gpt2};
+  \node[box, right=26mm of t, align=left, fill=softgrey] (d) {\textbf{Draft side}\\\scriptsize \code{shadow} \code{Sequence}, same \code{seq\_id}\\\scriptsize \code{draft\_bm} (prefix caching OFF)\\\scriptsize \code{draft\_runner} with distilgpt2};
+  \draw[dflow] (t) -- node[lbl, above] {\code{\_shadow(seq)} mirrors\\ \code{token\_ids} each round} (d);
+  \draw[flow] (d.south) -- ++(0,-0.7) -| node[lbl, pos=0.25, below] {\code{\_drop\_shadow()}\\ on preempt or finish} (t.south);
+\end{tikzpicture}}
+\caption{The shadow arrangement. A rejection rolls back \emph{both} block tables
+(\code{block\_manager.truncate} and \code{draft\_bm.truncate}) plus the prefix hashes
+on the target side.}
+\end{figure}
+
+The rollback is the trickiest sequence of assignments in the codebase:
+
+\begin{lstlisting}[language=Python, caption={llm\_engine.py, \_speculative\_decode: the rollback}]
+base_len = len(seq) - k             # length before drafts were appended
+target_probs = target_probs_from_logits(logits[i], seq.params, seq.token_ids)
+result = accept_reject(draft_tokens[seq.seq_id], draft_probs[seq.seq_id],
+                       target_probs, seq.generator, self.spec_stats)
+new_len = base_len + result.num_accepted
+seq.token_ids = seq.token_ids[:new_len] + [result.tokens[-1]]
+seq.num_computed = new_len
+self.block_manager.truncate(seq, len(seq.token_ids))
+shadow.token_ids = list(seq.token_ids)
+shadow.num_computed = min(shadow.num_computed, new_len)
+self.draft_bm.truncate(shadow, len(shadow.token_ids))
+\end{lstlisting}
+
+Note \code{seq.num\_computed = new\_len} while \code{len(seq.token\_ids)} is
+\code{new\_len + 1}: the invariant \code{num\_computed == len - 1} is restored
+exactly, so the next ordinary step sees a normal-looking sequence. Every speculative
+round leaves the world indistinguishable from a plain decode that happened to emit
+several tokens.
+
+\begin{honest}{The draft cache's capacity invariant is false, and breaking it kills the server (verified)}
+\file{docs/ARCHITECTURE.md} states: "The draft cache runs without prefix caching so
+its block usage is always a subset of the target's; one capacity check then covers
+both caches." A matching comment sits in \file{llm\_engine.py}. The scheduler checks
+only \code{self.block\_manager} (the target's), and \code{\_shadow} raises a bare
+\code{RuntimeError("draft KV cache exhausted")} if the draft cannot allocate.
+
+The reasoning is about \emph{retention}: the draft returns freed blocks to the free
+list immediately rather than parking them in an evictable pool, so it never hoards.
+That much is true. But it omits \emph{sharing}, which runs the other way. The
+target's \code{fork()} path (and its prefix cache) let several sequences point at the
+same physical blocks; the draft allocates a private copy of every block for every
+shadow. So for sequences with a shared prefix the target's physical usage is
+\emph{lower} than the sum over sequences while the draft's is exactly the sum. The
+draft therefore needs \emph{more} blocks than the target, the opposite of the claimed
+subset relation.
+
+Note this does not even depend on prefix caching: \code{fork()} shares blocks
+unconditionally, so the stated \emph{reason} for the invariant ("runs without prefix
+caching") does not deliver the invariant even on its own terms.
+
+\textbf{This was driven, not deduced.} An engine with \code{num\_blocks=12}, a
+63-token shared prompt and \code{n=4} completions, target and draft both distilgpt2:
+\begin{lstlisting}
+prompt tokens: 63
+target blocks total: 12 | draft blocks total: 12
+requested n=4 -> 4 sequences
+  step 1: target_used= 4  draft_used= 0
+RESULT: RuntimeError at step 2: draft KV cache exhausted
+\end{lstlisting}
+Step 1 shows the sharing working exactly as designed: four sequences occupy four
+blocks between them. The target-side check then passes comfortably, and the draft
+needs $4 \times 4 = 16$ blocks against 12 and dies. The capacity check that is
+documented as covering both caches did not cover the draft.
+
+At the default configuration arithmetic saves it by luck rather than by the
+invariant: \code{max\_batch\_size=8} times \code{max\_model\_len=1024} is 8192
+tokens, exactly \code{num\_blocks=512} times \code{block\_size=16}, so the draft
+cannot overflow even with zero sharing. Raise \code{max\_batch\_size} and the margin
+is gone. The project's own benchmark harness starts its server with
+\code{--max-batch-size 16} (\code{start\_server} in \file{bench.py}), double the safe
+bound, though it never combines that with a draft model. No test covers a draft
+engine under KV pressure with shared prefixes.
+\end{honest}
+
+\begin{honest}{Any exception in \code{step()} permanently kills the server (verified)}
+This is the finding that turns the previous one from an accounting error into an
+outage, and it is independent of it.
+
+\code{AsyncEngine.\_run\_loop} has \textbf{no exception handling whatsoever}:
+\begin{lstlisting}[language=Python]
+async def _run_loop(self):
+    while True:
+        if not self.engine.has_work:
+            self._wake.clear()
+            await self._wake.wait()
+        outputs = await asyncio.to_thread(self._locked_step)   # raises -> task dies
+        ...
+\end{lstlisting}
+The loop runs as a bare \code{asyncio.Task} created in \code{start()}. Nothing awaits
+it, nothing attaches a done-callback, and nothing inspects its exception. So when
+\code{step()} raises, the task dies silently and the server keeps accepting requests
+it will never answer. Every client hangs forever, on a healthy looking process whose
+\code{/healthz} still returns \code{\{"status": "ok"\}}.
+
+Driven with the same tight draft configuration, through \code{AsyncEngine}:
+\begin{lstlisting}
+submitted, seq_ids: [0, 1, 2, 3]
+RESULT: *** STREAM HUNG *** (25s timeout, no tokens ever arrived)
+background step-loop task done?  True
+step-loop died with: RuntimeError('draft KV cache exhausted')
+second request: *** ALSO HUNG *** -> server is permanently dead
+\end{lstlisting}
+Note the last line: it is not only the offending request that hangs. A subsequent,
+entirely innocent \code{"Hello there"} request hangs too, because the loop that would
+have served it no longer exists. One bad request permanently bricks the process until
+someone restarts it.
+
+The fix is routine (wrap the step in \code{try/except}, fail the affected sequences,
+keep looping) and its absence is the single most consequential gap in the project:
+every other bug in this document degrades quality or wastes memory, and this one
+converts \emph{any} of them into a total outage. It is worth being the first thing
+volunteered about the async layer, because "one coarse lock, carefully reasoned" and
+"no error handling at all" sit in the same 82-line file.
+\end{honest}
+
+\begin{honest}{One slow sequence throttles the whole batch's lookahead}
+\begin{lstlisting}[language=Python]
+k = min(self.config.num_speculative_tokens,
+        min(self.config.max_model_len - len(s) for s in seqs),
+        min(s.num_prompt_tokens + s.params.max_tokens - len(s) for s in seqs))
+\end{lstlisting}
+\code{k} is a \emph{minimum across the batch}, because the verify pass must be one
+rectangular \code{[B, k+1]} forward. So a single sequence one token from its
+\code{max\_tokens} limit drags \code{k} to 1 for everybody, and if it hits zero the
+whole batch silently falls back to \code{self.\_decode(seqs)}. With eight sequences
+finishing at staggered times, the batch spends much of its life at a reduced \code{k}.
+This is a genuine consequence of the rectangular-batch design and it is not mentioned
+anywhere in the documentation.
+\end{honest}
+
+\begin{honest}{\code{num\_speculative\_tokens} applies even with no draft model}
+\code{EngineConfig.num\_speculative\_tokens} defaults to 4 whether or not
+\code{draft\_model} is set, and \code{add\_request} uses it unconditionally:
+\begin{lstlisting}[language=Python]
+worst_blocks = (max_len + self.config.num_speculative_tokens
+                + self.config.block_size - 1) // self.config.block_size
+\end{lstlisting}
+So a plain engine reserves headroom for four speculative tokens it will never draft
+when deciding whether a request can fit at all. The effect is negligible (it can
+reject a request that is within one block of the absolute maximum) but it is a config
+value leaking into a code path that its feature is switched off for. Meanwhile
+\code{Scheduler.lookahead} \emph{is} correctly gated on \code{draft\_model} being set.
+The two places disagree about the same question.
+\end{honest}
+
+% ======================================================================
+\section{The async engine and the HTTP server}
+
+\subsection{Why a wrapper exists at all}
+
+\begin{jargon}{Event loop, blocking, \code{asyncio}}
+Python's \code{asyncio} runs many tasks on one thread by having each task voluntarily
+yield while it waits for something slow, like a network read. This works only if no
+task ever does a long stretch of CPU work without yielding: that would \emph{block}
+the loop and freeze every other connection. A transformer forward pass is exactly
+such a stretch.
+\end{jargon}
+
+\begin{lstlisting}[language=Python, caption={async\_engine.py, the whole trick}]
+async def _run_loop(self):
+    while True:
+        if not self.engine.has_work:
+            self._wake.clear()
+            await self._wake.wait()          # sleep until a request arrives
+        outputs = await asyncio.to_thread(self._locked_step)
+        for out in outputs:
+            queue = self._queues.get(out.seq_id)
+            if queue is not None:
+                queue.put_nowait(out)
+
+def _locked_step(self):
+    with self._lock:
+        return self.engine.step()
+\end{lstlisting}
+
+\code{asyncio.to\_thread} pushes the blocking \code{step()} onto a worker thread, so
+the event loop stays free to accept connections and flush SSE frames while the model
+computes. The \code{\_wake} event means an idle server does not spin.
+
+\begin{keyidea}{Why one coarse lock is the right call here, and when it stops being}
+A single \code{threading.Lock} serializes \code{step()}, \code{add\_request()} and
+\code{abort()}. This is as coarse as locking gets and it is the correct choice for
+this project: on CPU the model forward dominates step time so completely that lock
+contention is unmeasurable, and one lock is the version a person can reason about
+with certainty.
+
+It stops being right the moment you want to overlap prefill with decode, or pipeline
+the sampler behind the next forward, both of which require the engine's state to be
+mutable by two things at once. The README lists this correctly under "what I'd do
+differently" and gives the right reason. Volunteering "here is the simple thing, here
+is exactly when it breaks" is a better answer than either defending it as optimal or
+apologizing for it.
+\end{keyidea}
+
+\begin{jargon}{GIL (Global Interpreter Lock)}
+CPython permits only one thread to execute Python bytecode at a time. Threading
+therefore does not speed up Python code. It does help here because PyTorch releases
+the GIL during tensor operations: while \code{step()} is inside a matrix multiply, the
+event loop thread genuinely runs. The design depends on this, and it is nowhere stated
+in the code.
+\end{jargon}
+
+\subsection{The request path}
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tikzpicture}[x=1cm, y=1cm]
+  \foreach \x/\name in {0/{client}, 3.2/{app.py}, 6.4/{AsyncEngine}, 9.6/{worker thread}, 12.8/{LLMEngine}} {
+    \node[box, font=\scriptsize, minimum width=2.3cm] at (\x, 0) {\name};
+    \draw[draw=linegrey, dashed] (\x, -0.4) -- (\x, -7.6);
+  }
+  \def\ar#1#2#3#4{\draw[flow] (#1, #3) -- node[lbl, above, font=\tiny] {#4} (#2, #3);}
+
+  \ar{0}{3.2}{-0.9}{POST /v1/completions\\ \code{stream: true}}
+  \ar{3.2}{6.4}{-1.5}{\code{engine.submit(prompt, params)}}
+  \ar{6.4}{9.6}{-2.1}{\code{to\_thread(\_add)}}
+  \ar{9.6}{12.8}{-2.6}{\code{add\_request()} under lock}
+  \draw[dflow] (12.8,-3.1) -- node[lbl, above, font=\tiny] {\code{seq\_ids}} (6.4,-3.1);
+  \node[lbl, font=\tiny, anchor=west] at (6.6,-3.5) {create one \code{asyncio.Queue} per seq\_id; \code{\_wake.set()}};
+  \ar{6.4}{3.2}{-3.9}{\code{seq\_ids}}
+  \node[lbl, font=\tiny, anchor=west] at (3.3,-4.3) {return \code{StreamingResponse(\_sse\_stream(...))}};
+
+  \draw[draw=inkblue, dashed, rounded corners] (5.6,-4.7) rectangle (13.9,-6.4);
+  \node[lbl, font=\tiny\bfseries, text=inkblue, anchor=west] at (5.7,-4.55) {step loop, repeating};
+  \ar{6.4}{9.6}{-5.1}{\code{to\_thread(\_locked\_step)}}
+  \ar{9.6}{12.8}{-5.6}{\code{step()}}
+  \draw[dflow] (12.8,-6.0) -- node[lbl, above, font=\tiny] {\code{list[StepOutput]}} (6.4,-6.0);
+  \node[lbl, font=\tiny, anchor=west] at (6.6,-6.25) {\code{queue.put\_nowait(out)} per seq};
+
+  \ar{6.4}{3.2}{-6.8}{\code{stream(sid)} yields}
+  \ar{3.2}{0}{-7.2}{\code{data: \{...\}} SSE frame, one per step}
+  \node[lbl, font=\tiny, anchor=west, text=okgreen] at (0.1,-7.5) {\code{data: [DONE]} when every seq finished; \code{finally: abort(sid)} for each};
+\end{tikzpicture}}
+\caption{One streaming request. The engine never learns what HTTP is; it puts
+\code{StepOutput} objects into queues, and \file{app.py} turns those into SSE frames.}
+\end{figure}
+
+\begin{jargon}{SSE (Server-Sent Events)}
+A way for a server to keep an HTTP response open and push text at the client as it
+becomes available, each chunk prefixed \code{data: } and terminated by a blank line.
+It is how a chatbot's answer appears word by word instead of all at once. Simpler than
+a WebSocket and one-directional, which is all that is needed.
+\end{jargon}
+
+The fan-out for \code{n > 1} merges several per-sequence queues into one output queue
+so that the SSE frames interleave as they are produced rather than completing one
+choice before starting the next:
+
+\begin{lstlisting}[language=Python, caption={app.py, \_sse\_stream fan-in}]
+async def one(index, sid, out_q):
+    async for out in engine.stream(sid):
+        await out_q.put((index, out))
+    await out_q.put((index, None))          # sentinel: this choice is done
+
+out_q = asyncio.Queue()
+tasks = [asyncio.create_task(one(i, sid, out_q)) for i, sid in enumerate(seq_ids)]
+live = len(seq_ids)
+while live > 0:
+    index, out = await out_q.get()
+    if out is None:
+        live -= 1
+        continue
+    if await raw.is_disconnected():
+        break
+    yield f"data: {json.dumps(payload)}\n\n"
+\end{lstlisting}
+
+The \code{finally} block is the part that matters for a server that must survive its
+clients: it cancels the fan-in tasks and aborts every sequence, so a client that hangs
+up mid-generation does not leave the engine computing tokens nobody will read.
+
+\subsection{The API surface}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{p{3.4cm}p{1.4cm}p{9.2cm}}
+\toprule
+\textbf{Endpoint} & \textbf{Method} & \textbf{Purpose} \\
+\midrule
+\code{/v1/completions} & POST & the OpenAI completions subset, streaming or not \\
+\code{/v1/models} & GET & reports the single loaded model \\
+\code{/healthz} & GET & liveness, used by the benchmark's \code{start\_server} \\
+\code{/metrics} & GET & engine counters, the observability surface \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\code{/metrics} is worth calling out because it exposes precisely the internals this
+document has been describing:
+
+\begin{itemize}
+\item \code{num\_free\_blocks}, \code{num\_total\_blocks}: KV cache pressure
+\item \code{prefix\_cache\_queries}, \code{prefix\_cache\_hit\_tokens}: is the
+      prefix cache earning its keep
+\item \code{cow\_copies}, \code{evictions}: how much sharing is breaking down
+\item \code{preemptions}: is the engine thrashing
+\item \code{speculative\_acceptance\_rate}: is the draft model worth its cost
+\end{itemize}
+
+Someone operating this server could actually diagnose it, which is more than many
+production systems offer.
+
+\begin{honest}{\code{/healthz} reports liveness it has not checked}
+Following directly from the step-loop finding: \code{healthz} returns a hardcoded
+\code{\{"status": "ok"\}} without consulting the engine at all. It cannot distinguish
+a healthy server from one whose step loop died twenty minutes ago. Since the whole
+point of a liveness endpoint is to let an orchestrator restart a wedged process, and
+this project's step loop can wedge, the one mechanism that would have recovered the
+outage automatically is the one that reports everything is fine. Checking
+\code{engine.\_task.done()} would be a two-line fix.
+\end{honest}
+
+\begin{honest}{The OpenAI compatibility is a thin subset, and \code{logprobs} is a lie of omission}
+Every response includes \code{"logprobs": None}, which is an OpenAI field the engine
+does not implement; it emits the key and always nulls it. Also absent:
+\code{/v1/chat/completions} (the endpoint essentially every client actually uses),
+\code{echo}, \code{best\_of}, \code{presence\_penalty}, \code{frequency\_penalty}, and
+a \code{usage} token-count block. The README says "OpenAI subset", which is accurate.
+Just be ready for "so can I point the OpenAI SDK at it?": the answer is yes for
+\code{client.completions.create}, no for \code{client.chat.completions.create}.
+\end{honest}
+
+% ======================================================================
+\section{What was actually verified here}
+\label{sec:verify}
+
+Everything in this section was executed on this machine while writing this document.
+Nothing in it is taken from the README on trust.
+
+\subsection{The declared dependencies do not run the project}
+
+The very first thing attempted was \code{pytest}, and it failed. Not on a subtle
+assertion: on \emph{loading a model at all}.
+
+\begin{lstlisting}
+E  TypeError: GPT2LMHeadModel.__init__() got an unexpected keyword argument 'dtype'
+...
+4 failed, 4 passed, 1 warning, 9 errors in 1008.34s
+\end{lstlisting}
+
+\begin{honest}{\file{requirements.txt} declares a version range the project cannot run in}
+\file{engine/model.py} calls
+\code{AutoModelForCausalLM.from\_pretrained(model\_name, dtype=torch.float32)}. The
+\code{dtype} keyword is recent: Hugging Face spent years spelling it
+\code{torch\_dtype} and only accepted \code{dtype} later. \file{requirements.txt}
+declares:
+\begin{lstlisting}
+transformers>=4.44,<6
+\end{lstlisting}
+This was bisected against the real package index on this machine:
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{transformers} & \textbf{In declared range?} & \textbf{Result} \\
+\midrule
+4.51.3 & yes & \code{TypeError}, no model loads \\
+4.55.4 & yes & \code{TypeError}, no model loads \\
+4.56.0 & yes & works \\
+5.14.1 & yes & works \\
+\bottomrule
+\end{tabular}
+\end{table}
+So the true floor is \textbf{4.56.0}, and the declared floor is 4.44. Every version
+from 4.44 to 4.55.4, which is roughly two years of releases and the larger part of
+the declared range, gives a clone of this repository that cannot load a single model.
+A reviewer who runs \code{pip install -r requirements.txt} today gets a working
+resolution only because pip picks the newest; a reviewer with a pinned or cached
+environment, or anyone reading this in a year against \code{<6}, may not. The machine
+used for this document had 4.51.3 installed system-wide, which is exactly how the
+problem surfaced.
+
+The fix is one character short of trivial (\code{transformers>=4.56,<6}). The finding
+is not the severity, it is the category: the project's headline claim is that it was
+\emph{verified by actually running it}, and its declared environment is not the
+environment it was verified in. Everything below was therefore run against
+transformers 5.14.1 in an isolated virtualenv, not against the declared range.
+\end{honest}
+
+\subsection{The test suite}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lrl}
+\toprule
+\textbf{Module} & \textbf{Tests} & \textbf{What it covers} \\
+\midrule
+\code{test\_block\_manager.py} & 15 & allocation, COW, prefix cache, LRU, truncate \\
+\code{test\_scheduler.py} & 6 & admission, preemption, the 300-step churn test \\
+\code{test\_sampling.py} & 7 & greedy, top-k, top-p, penalties, determinism \\
+\midrule
+\textbf{Total} & \textbf{28} & \textbf{28 passed in 0.76s} \\
+\bottomrule
+\end{tabular}
+\caption{The model-free suites, run against the system interpreter. That the
+allocator, the scheduler and the sampler can be fully exercised in under a second
+without loading a single weight is a direct dividend of the
+\code{BlockManager}-holds-no-tensors decision, and it is why these 28 passed on an
+environment where nothing model-backed could even start.}
+\end{table}
+
+Re-run in an isolated virtualenv on transformers 5.14.1, where the model-backed
+tests can actually load a model, the \textbf{entire suite passes}:
+
+\begin{lstlisting}
+55 passed, 2 warnings in 897.56s (0:14:57)
+\end{lstlisting}
+
+\begin{keyidea}{The code is correct; only the declared environment is wrong}
+This is the fair reading, and it matters. All 55 tests pass: the logit parity
+against Hugging Face, the paged-versus-plain attention check, the 300-step churn
+property test, the 4000-sample speculative distribution tests, the concurrent
+streaming API tests. Nothing in the engine is broken.
+
+The dependency finding above is therefore about packaging, not about the code. It
+would be unfair to read the initial red wall of errors as "the project does not
+work". It works; it just does not declare the environment it works in. Those are
+different criticisms and only the second one is true.
+\end{keyidea}
+
+\subsection{The \code{seq\_states} leak, confirmed}
+
+The leak described earlier was not inferred from reading. It was driven: twenty
+sequential \code{generate()} calls against a \code{distilgpt2} engine, then a read of
+the engine's internals.
+
+\begin{lstlisting}
+generates issued      : 20
+len(engine.seq_states): 20
+scheduler.running     : 0
+scheduler.waiting     : 0
+free blocks before/now: 128 128
+shadows               : 0
+sample retained state : seq_id=0 emitted_text=' "I\'m not sure what'
+\end{lstlisting}
+
+Every other structure cleaned up perfectly: the scheduler's queues are empty, the
+block manager is back to all 128 blocks free, no shadows remain. Only
+\code{seq\_states} still holds all twenty entries, each with the finished request's
+complete generated text. The behaviour matches the source exactly: \code{\_finish()}
+has no \code{seq\_states.pop}. The contrast is the interesting part, since the memory
+management the project is \emph{about} is impeccable, and the leak is in the
+incidental bookkeeping beside it.
+
+\subsection{Benchmarks: what the README claims and what this run observed}
+\label{sec:bench}
+
+\begin{keyidea}{Why these numbers could be re-run at all}
+This is unusually lucky and worth stating. The committed JSON in
+\file{benchmarks/results/} records the machine each number came from, and it is an
+11th Gen Intel i7-1185G7 with 8 cores running the same Linux kernel as the machine
+this document was built on. The cached \code{gpt2} and \code{distilgpt2} weights are
+present locally. So the benchmarks are not being taken on trust or approximated: they
+were re-executed on the same hardware, and the results below are what this machine
+actually printed.
+\end{keyidea}
+
+\subsubsection{Conditions of the re-run, stated up front}
+
+Three things differed from the committed run of 2026-07-06, and they must be on
+the table before any number is:
+
+\begin{itemize}
+\item \textbf{Library versions.} The re-run used \code{torch 2.10.0+cu128} and
+      \code{transformers 5.14.1}. The original's versions are \emph{unknown},
+      for a reason that is itself a finding (below). Note also that
+      \code{+cu128} is a CUDA build being run on CPU, whereas the README's own
+      setup instructions install the CPU-only wheel. That alone can move CPU
+      kernel performance.
+\item \textbf{Background load.} The machine had a desktop session and several
+      other processes active. The heavy competitors were waited out (the run
+      started at a 1-minute load average of 4.77), but this was not a quiet
+      benchmarking host, whereas the original may have been.
+\item \textbf{Thread count.} \code{torch.get\_num\_threads()} reports \textbf{4},
+      not 8. The i7-1185G7 has 4 physical cores and 8 logical threads; PyTorch
+      defaults to physical cores. The README describes the machine as
+      "8 threads", and the JSON's \code{cores: 8} is \code{os.cpu\_count()},
+      which counts logical processors. The compute actually ran on 4.
+\end{itemize}
+
+\begin{honest}{The benchmark harness does not record the versions its numbers depend on}
+\code{machine\_info()} in \file{bench.py} captures CPU model, core count,
+platform, Python version and \code{"device": "cpu"}. It does not capture the
+\code{torch} version, the \code{transformers} version, or
+\code{torch.get\_num\_threads()}.
+
+Those are precisely the variables a throughput number depends on. The committed
+JSON therefore records enough to identify the \emph{machine} and not enough to
+reproduce the \emph{measurement}, which is the whole purpose of committing it. It
+is the reason the discrepancy below cannot be fully attributed: the experiment
+that would settle it (re-run on the original's library versions) is not
+recoverable from what was recorded. Three extra lines in \code{machine\_info()}
+would have prevented that permanently.
+\end{honest}
+
+\subsubsection{What the re-run measured}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Measurement} & \textbf{README / JSON} & \textbf{Re-run} & \textbf{Re-run / orig} \\
+\midrule
+Throughput, concurrency 1 (tok/s) & 44.69 & 32.90 & 0.74x \\
+Throughput, concurrency 4 (tok/s) & 83.80 & 73.53 & 0.88x \\
+Throughput, concurrency 8 (tok/s) & 113.52 & 99.19 & 0.87x \\
+Throughput, concurrency 16 (tok/s) & 108.47 & 108.88 & 1.00x \\
+HF \code{generate()} sequential (tok/s) & 40.04 & 31.89 & 0.80x \\
+\midrule
+TTFT mean, concurrency 1 (s) & 0.069 & 0.089 & \\
+TTFT mean, concurrency 4 (s) & 0.266 & 0.289 & \\
+TTFT mean, concurrency 8 (s) & 0.541 & 0.604 & \\
+TTFT mean, concurrency 16 (s) & 1.266 & 1.149 & \\
+\bottomrule
+\end{tabular}
+\caption{Absolute throughput came in 13\% to 26\% below the committed numbers,
+which is what a contended, differently-versioned host should do. Every
+\emph{shape} the README describes reproduced: throughput climbing with
+concurrency and flattening by 16, TTFT growing roughly linearly with queue depth.}
+\end{table}
+
+Absolute numbers are the least interesting thing here, because they are the most
+environment-dependent. The README makes \emph{ratio} claims, and ratios are what
+should survive. They did:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lrrl}
+\toprule
+\textbf{Claim the README actually makes} & \textbf{README} & \textbf{Re-run} & \textbf{Verdict} \\
+\midrule
+Continuous batching, concurrency 1 to 8 & 2.54x & \textbf{3.01x} & reproduced, stronger \\
+Engine at 8 concurrent vs HF sequential & 2.84x & \textbf{3.11x} & reproduced, stronger \\
+Speculative decoding vs plain & 0.72x & \textbf{1.14x} & \textbf{did not reproduce} \\
+Speculative acceptance rate & 0.5404 & \textbf{0.5404} & exact, to 4 decimals \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{keyidea}{The two headline claims reproduced, and the re-run is kinder than the README}
+The task this document was written for asked specifically about "113.5 tokens/s
+and 2.8x over a baseline". The verdict on both:
+
+\textbf{113.5 tok/s did not reproduce as an absolute number}: this machine
+measured 99.19 tok/s at the same concurrency 8, about 13\% lower, on a contended
+host with unknown version drift. The number is plausible and clearly of the right
+order, but it should be quoted as "about 100 to 115 tok/s on a laptop CPU
+depending on conditions", not as a constant.
+
+\textbf{The 2.8x reproduced, and came out at 3.11x.} The engine beat sequential
+Hugging Face by \emph{more} than the README claims, because contention hurt the
+one-at-a-time baseline more than it hurt the batched engine, which is exactly the
+effect continuous batching exists to produce. The same is true of the 2.5x
+batching claim, which measured 3.01x.
+
+So the README's two headline performance claims are conservative on this machine.
+That is the right direction for a claim to be wrong in, and it is consistent with
+the pattern of everything else in this project: nothing is inflated.
+\end{keyidea}
+
+\begin{honest}{The speculative decoding result reversed sign, and this is the real discrepancy}
+The README's most distinctive claim is a \emph{negative} one, and it is the one
+that did not hold:
+
+\begin{quote}\small
+"Speculative decoding is correct (identical greedy output, 54\% of drafts
+accepted) but $\sim$0.7x slower here \ldots It stays in the codebase as a
+correctness-verified feature, not a CPU speedup."
+\end{quote}
+
+The re-run measured \textbf{1.14x faster}, not 0.72x slower. Broken out:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lrrr}
+\toprule
+& \textbf{README} & \textbf{Re-run} & \\
+\midrule
+plain, wall time (s) & 5.728 & 8.105 & plain got \emph{much} worse \\
+speculative, wall time (s) & 7.958 & 7.111 & speculative got \emph{better} \\
+tokens drafted & 322 & 322 & identical \\
+tokens accepted & 174 & 174 & identical \\
+acceptance rate & 0.5404 & 0.5404 & identical \\
+\midrule
+speedup & 0.72x & \textbf{1.14x} & sign flip \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{First, what this is not.} It is not a correctness problem, and the
+evidence is unusually clean: 322 drafted and 174 accepted, in both runs, to the
+token. Greedy decoding is deterministic, so the algorithm made bit-for-bit
+identical decisions six weeks and two library versions apart. The engine's
+determinism claim is confirmed about as strongly as it could be. Only the
+\emph{clock} disagreed.
+
+\textbf{What changed.} Under uniform slowdown a ratio is preserved, and this ratio
+was not, so the effect is differential: plain decode degraded 41\% while
+speculative \emph{improved} 11\%. The coherent explanation is per-forward
+overhead. Plain decode does many tiny forwards (one token position each);
+speculative does far fewer, fatter ones (the draft's k, then one target forward
+over k+1=5 positions). Anything that raises fixed per-forward cost, CPU
+contention, a different torch build, a CUDA-enabled wheel dispatching on CPU,
+penalizes the many-small-forwards strategy and barely touches the
+fewer-large-forwards one.
+
+The same mechanism explains the otherwise odd row in the table above: concurrency
+1 fell to 0.74x while concurrency 16 held at 1.00x. Large batches amortize
+per-forward overhead; batch-of-one does not. The two anomalies have one cause.
+
+\textbf{Why this matters more than a number.} The README draws a firm conclusion
+from its measurement ("not a CPU speedup") and the conclusion is not stable: the
+sign of that result depends on the host. Ironically, the README's own reasoning
+predicts this. It says speculative decoding "pays off when the target forward
+dominates draft cost", and per-forward overhead is one of the things that shifts
+that balance. The project reasoned correctly and then over-committed to one
+sample of a quantity it had itself identified as conditional.
+
+\textbf{The honest position} is narrower and stronger than either the README's or
+a naive "it is actually faster": on this hardware, speculative decoding with
+\code{gpt2}/\code{distilgpt2} at k=4 sits near break-even, and which side of it
+you land on depends on the software environment. Two measurements exist, 0.72x and
+1.14x, and neither is the property of the algorithm. What is stable, and what the
+project can defend without qualification, is the acceptance rate and the exact
+output equivalence.
+\end{honest}
+
+\begin{honest}{The committed JSON was left exactly as it was}
+Re-running \code{bench.py all} overwrites \file{benchmarks/results/*.json}. The
+originals were restored byte-for-byte afterwards, so the repository's committed
+measurements are untouched and this document's comparison is against them as
+recorded. The re-run's numbers live only in this document. If the owner wants the
+new figures committed, that is a deliberate decision to make separately, and it
+should not be made from a contended host.
+\end{honest}
+
+% ======================================================================
+\section{Consolidated honest assessment}
+
+\subsection{What is genuinely strong}
+
+\begin{enumerate}
+\item \textbf{The correctness evidence is real and layered.} Logit parity against
+      Hugging Face at \code{1e-3}, a paged-versus-plain attention check at
+      \code{1e-4}, a 300-step property test on block accounting, and a 4000-sample
+      total-variation test on the speculative distribution. The project does not
+      assert its correctness; it demonstrates it at four different levels of
+      abstraction.
+\item \textbf{The BlockManager holds no tensors.} This one decision is why the
+      hardest logic in the codebase is testable in under a second, and it is the
+      thing most worth stealing from this project.
+\item \textbf{The honesty is unusual and is an asset.} A README that reports its own
+      headline feature going 0.72x, and explains why, is more persuasive than one
+      reporting a 2x speedup. The absent vLLM comparison is stated as absent, with
+      the reason (no GPU) rather than a fabricated number.
+\item \textbf{The numbers in the README are faithful to the JSON.} Every figure
+      checked (44.7, 83.8, 113.5, 108.5, 40.0, 32.2, 0.54, the 2.5x, the 2.8x, the
+      0.7x) transcribes or divides correctly from \file{benchmarks/results/}. There
+      is no rounding in the flattering direction.
+\end{enumerate}
+
+\subsection{The findings, ranked by what they would cost in an interview}
+
+The top three were all found by \emph{running} the project rather than reading it,
+which is itself the lesson: the code reads well enough that none of them are visible
+from the source alone.
+
+\begin{enumerate}
+\item \textbf{No error handling in the step loop, so any \code{step()} exception
+      permanently bricks the server} (verified: a second innocent request hangs too,
+      while \code{/healthz} still reports ok). This ranks first because it is a
+      severity multiplier: it converts every other bug in this list, and every one
+      not yet found, into a total outage rather than a bad response.
+\item \textbf{The draft cache's capacity invariant is false and reachable} (verified:
+      \code{RuntimeError: draft KV cache exhausted} on the second step of an
+      \code{n=4} shared-prompt request). Worse than a bug, it is a \emph{documented}
+      invariant in \file{docs/ARCHITECTURE.md} that the code does not have, and the
+      stated reason for it ("runs without prefix caching") does not imply it even in
+      principle, because \code{fork()} shares blocks regardless. Being asked "why is
+      one capacity check enough?" and answering from the architecture document would
+      be answering wrongly. Combined with item 1, it is a remotely triggerable
+      permanent outage.
+\item \textbf{\file{requirements.txt} declares a range the project cannot run in}
+      (verified by bisection: needs \code{transformers>=4.56}, declares
+      \code{>=4.44}). Cheap to fix, and awkward for a project whose central claim is
+      that nothing is asserted that was not verified by running it.
+\item \textbf{\code{seq\_states} leaks for every completed request} (verified: 20
+      entries retained after 20 finished generations, each holding the full output
+      text). A memory leak in the long-running-service part of a project about
+      long-running services.
+\item \textbf{Seeded \code{n > 1} determinism is load-dependent} because the
+      no-batch-room path burns a generator draw before requeueing. A documented
+      guarantee with a hole and no test.
+\item \textbf{The TTFT curve is a readout of unbatched prefill}, not a general
+      property of continuous batching. The README treats it as expected without
+      connecting it to its own design note two sections away.
+\item \textbf{The attention is a gather-into-dense, not a paged kernel.} Already
+      disclosed in the README, so it costs nothing if volunteered and a lot if
+      discovered.
+\item \textbf{The speculative result's sign is environment-dependent} (measured
+      1.14x here against the README's 0.72x, with a bit-identical acceptance
+      rate). The README states a conditional result as a settled one. Related:
+      \textbf{the harness records no library versions}, so the discrepancy cannot
+      be attributed and the committed numbers cannot truly be reproduced.
+\item \textbf{The detokenizer is $O(n^2)$} in output length, invisible at the
+      benchmark's 32 tokens.
+\item \textbf{Smaller items:} \code{\_match\_prefix} computed three times per
+      admission; \code{EOS\_TOKEN\_ID} hardcoded rather than read from the tokenizer;
+      \code{num\_speculative\_tokens} applied with no draft model;
+      \code{slot\_mapping} rebuilding whole-context Python lists every step;
+      just-admitted prompts preemptible in the same step; prefix cache trusting
+      SHA-256 without verification; \code{/healthz} reporting liveness it never
+      checks.
+\end{enumerate}
+
+\begin{keyidea}{The pattern behind the top four}
+Every one of them lives in the space \emph{around} the algorithms rather than in
+them. The paged cache, the scheduler, the accept/reject sampler: all correct, all
+well tested, all defensible in detail. The failures are in dependency declaration,
+process lifetime, error propagation and cross-component invariants, which is
+precisely the set of things unit tests do not reach and a short benchmark run cannot
+reveal.
+
+That is a genuinely useful thing to be able to say about one's own project: the hard
+part was done well, and the gaps are in the boring parts. It is also the honest
+answer to "what would you do next", ahead of the GPU kernel.
+\end{keyidea}
+
+\subsection{What the benchmarks do and do not support}
+
+\begin{honest}{The "2.8x over baseline" is honest but not apples-to-apples}
+The claim compares 113.52 tok/s (this engine, 8 concurrent) against 40.04 tok/s (HF
+\code{generate()}, sequential). Both numbers are real and both are in the committed
+JSON. But they come from \emph{different harnesses}: \code{cmd\_sweep} drives a real
+server process over HTTP with SSE parsing, while \code{cmd\_baseline} calls
+\code{ref.generate()} in-process with no serialization at all.
+
+The direction of the bias favours the baseline: the engine is carrying HTTP, JSON,
+SSE and asyncio overhead that the baseline does not, so the true engine-versus-HF gap
+is if anything \emph{wider} than 2.8x. The comparison is therefore conservative,
+which is the right way to be wrong. It is still not a controlled comparison, and the
+honest framing is "2.8x end-to-end including our serving overhead against a bare
+in-process loop", which is a more interesting claim anyway. Note also that HF
+\code{generate()} sequentially is a weak baseline by construction: the fair strong
+baseline is HF with its own batching, which is not measured.
+\end{honest}
+
+\begin{honest}{The token counter in the sweep counts SSE events, not tokens}
+\code{\_stream\_one} in \file{bench.py} does \code{tokens += 1} per \code{data: } line
+rather than counting \code{new\_token\_ids}. For plain decoding one step emits one
+token so one event is one token, and the totals check out exactly
+($8 \times 32 = 256$). But it is a proxy that happens to be right, not a measurement.
+If the sweep were ever run with \code{--draft-model} set, one event would carry up to
+$k+1$ tokens and the reported throughput would be \emph{understated by up to 5x} with
+no warning. A latent trap in the harness for whoever runs the GPU comparison the
+README calls future work.
+\end{honest}
+
+\begin{honest}{The speculative benchmark measures a warm prefix cache}
+\code{cmd\_speculative} runs \code{run(plain)} once to warm up and then measures a
+second \code{run(plain)} over \emph{the same four prompts}, with prefix caching on by
+default. The measured run therefore gets its prompts back from the prefix cache
+almost for free. The same is true of the speculative engine, so the comparison
+between them is fair, which is what the benchmark is for. It does mean the 44.69
+tok/s figure is a warm-cache number, and \emph{that same figure} is reused in the
+README's baseline table as "this engine, 1 concurrent request", where it is being
+compared against a cold HF baseline. It is a small effect on a 32-token workload, and
+it points the same conservative direction. Worth knowing before someone asks whether
+the caches were warm.
+\end{honest}
+
+\subsection{The one thing this project is missing}
+
+The README says it plainly and it is correct: there is no comparison against a
+production engine, because vLLM needs a GPU and this machine has none. That is the
+right call. Fabricating the number would be worse than not having it.
+
+But it means the project can demonstrate that its \emph{mechanisms} work and cannot
+demonstrate that they work \emph{well}. Everything measured here says "continuous
+batching gives 2.5x on 8 CPU threads". Nothing measured here says anything about how
+this design would behave where these designs actually live. The project knows this,
+states it, and lists it as the obvious next step, which is the only defensible
+position available without hardware.
+
+% ======================================================================
+\section{Glossary}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{p{3.4cm}p{11.4cm}}
+\toprule
+\textbf{Term} & \textbf{Meaning in this project} \\
+\midrule
+Token & An integer id for a chunk of text. GPT-2 has 50{,}257. \\
+Logits & 50{,}257 raw scores for what the next token should be. \\
+KV cache & Stored keys and values for past tokens, so they are computed once. \\
+Block & A fixed-size chunk of KV cache holding \code{block\_size} (16) tokens. \\
+Slot & A single token's place in the cache: \code{block\_id * block\_size + offset}. \\
+Block table & A sequence's list of block ids: its page table. \\
+Prefill & The first forward over a whole prompt. Compute-bound. \\
+Decode & Each subsequent one-token-per-sequence forward. Memory-bound. \\
+Continuous batching & Re-deciding the batch at every token boundary. \\
+Preemption & Evicting a running sequence's blocks under KV pressure. \\
+COW & Copy-on-write: share a block until someone writes, then copy. \\
+Prefix caching & Reusing cached blocks for a prompt prefix already seen. \\
+Draft / target & The small guessing model and the real model that verifies. \\
+Acceptance rate & Fraction of drafted tokens the target agreed with. \\
+TTFT & Time to first token: how long a user waits before anything appears. \\
+Shadow & The draft side's mirror of a target sequence. \\
+SSE & Server-Sent Events: the streaming HTTP response format. \\
+TV distance & Total variation: how far apart two distributions are. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}
